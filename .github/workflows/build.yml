@@ -21,10 +21,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup .NET 8.0
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 8.0.x
+      #- name: Setup .NET 8.0
+      #  uses: actions/setup-dotnet@v4
+      #  with:
+      #    dotnet-version: 8.0.x
 
       - name: Setup .NET 10.0
         uses: actions/setup-dotnet@v4
@@ -136,4 +136,4 @@ jobs:
 
       # 6. NuGet 包发布
       - name: Publish NuGet packages (API Key)
-        run: dotnet nuget push ./artifacts/*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.NUGET_API_KEY }} --skip-duplicate
+        run: dotnet nuget push ./artifacts/*.nupkg --source https://dev.uu163yun.com/ngs/nuget --api-key ${{ secrets.NUGET_API_KEY }} --skip-duplicate

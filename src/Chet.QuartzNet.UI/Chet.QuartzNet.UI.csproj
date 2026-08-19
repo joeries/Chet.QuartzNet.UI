@@ -1,11 +1,11 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
 
 	<PropertyGroup>
-		<TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+		<TargetFrameworks>net10.0</TargetFrameworks>
 		<Nullable>enable</Nullable>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<PackageId>Chet.QuartzNet.UI</PackageId>
-		<PackageVersion>2.3.0</PackageVersion>
+		<PackageVersion>2.3.1</PackageVersion>
 		<Product>Chet.QuartzNet.UI 可视化作业调度管理系统</Product>
 		<Description>基于QuartzNet和VbenAdmin的可视化作业调度管理系统，支持文件存储和数据库存储、JWT认证登录</Description>
 		<PackageProjectUrl>https://github.com/qiect/Chet.QuartzNet.UI</PackageProjectUrl>
