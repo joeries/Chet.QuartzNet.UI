@@ -28,14 +28,6 @@
     <file src="bin\Release\net10.0\Chet.QuartzNet.EFCore.SQLite.dll" target="lib\net10.0" />
     <file src="bin\Release\net10.0\Chet.QuartzNet.EFCore.SQLite.pdb" target="lib\net10.0" />
     
-    <!-- Chet.QuartzNet.EFCore .NET 10 -->
-    <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.dll" target="lib\net10.0" />
-    <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.pdb" target="lib\net10.0" />
-    
-    <!-- Chet.QuartzNet.EFCore.SQLite .NET 10 -->
-    <file src="bin\Release\net10.0\Chet.QuartzNet.EFCore.SQLite.dll" target="lib\net10.0" />
-    <file src="bin\Release\net10.0\Chet.QuartzNet.EFCore.SQLite.pdb" target="lib\net10.0" />
-    
     <!-- Additional files -->
     <file src="..\..\icon.png" target="" />
     <file src="..\..\docs\nuget\README.md" target="" />

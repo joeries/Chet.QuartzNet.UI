@@ -43,22 +43,6 @@
     <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.dll" target="lib\net10.0" />
     <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.pdb" target="lib\net10.0" />
     
-    <!-- Chet.QuartzNet.UI .NET 10 -->
-    <file src="bin\Release\net10.0\Chet.QuartzNet.UI.dll" target="lib\net10.0" />
-    <file src="bin\Release\net10.0\Chet.QuartzNet.UI.pdb" target="lib\net10.0" />
-    
-    <!-- Chet.QuartzNet.Core .NET 10 -->
-    <file src="..\Chet.QuartzNet.Core\bin\Release\net10.0\Chet.QuartzNet.Core.dll" target="lib\net10.0" />
-    <file src="..\Chet.QuartzNet.Core\bin\Release\net10.0\Chet.QuartzNet.Core.pdb" target="lib\net10.0" />
-    
-    <!-- Chet.QuartzNet.Models .NET 10 -->
-    <file src="..\Chet.QuartzNet.Models\bin\Release\net10.0\Chet.QuartzNet.Models.dll" target="lib\net10.0" />
-    <file src="..\Chet.QuartzNet.Models\bin\Release\net10.0\Chet.QuartzNet.Models.pdb" target="lib\net10.0" />
-    
-    <!-- Chet.QuartzNet.EFCore .NET 10 -->
-    <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.dll" target="lib\net10.0" />
-    <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.pdb" target="lib\net10.0" />
-    
     <!-- Additional files -->
     <file src="..\..\icon.png" target="" />
     <file src="..\..\docs\nuget\README.md" target="" />
