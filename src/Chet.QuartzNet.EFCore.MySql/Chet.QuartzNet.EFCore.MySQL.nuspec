@@ -12,27 +12,22 @@
     <readme>README.md</readme>
     <releaseNotes>https://github.com/qiect/Chet.QuartzNet.UI/releases/tag/2.3.1</releaseNotes>
     <dependencies>
-      <group targetFramework=".NETCoreApp8.0">
-        <dependency id="Pomelo.EntityFrameworkCore.MySql" version="8.0.0" exclude="Build,Analyzers" />
-        <dependency id="Microsoft.EntityFrameworkCore.Tools" version="8.0.0" exclude="Build,Analyzers" />
-        <dependency id="Microsoft.EntityFrameworkCore.Design" version="8.0.0" exclude="Build,Analyzers" />
-      </group>
       <group targetFramework=".NETCoreApp10.0">
-        <dependency id="Pomelo.EntityFrameworkCore.MySql" version="9.0.0" exclude="Build,Analyzers" />
-        <dependency id="Microsoft.EntityFrameworkCore.Tools" version="9.0.0" exclude="Build,Analyzers" />
-        <dependency id="Microsoft.EntityFrameworkCore.Design" version="9.0.0" exclude="Build,Analyzers" />
+        <dependency id="MySql.EntityFrameworkCore" version="10.0.7" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.EntityFrameworkCore.Tools" version="10.0.7" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.EntityFrameworkCore.Design" version="10.0.7" exclude="Build,Analyzers" />
       </group>
     </dependencies>
   </metadata>
   <files>
 
     <!-- Chet.QuartzNet.EFCore -->
-    <file src="..\Chet.QuartzNet.EFCore\bin\Release\net8.0\Chet.QuartzNet.EFCore.dll" target="lib\net8.0" />
-    <file src="..\Chet.QuartzNet.EFCore\bin\Release\net8.0\Chet.QuartzNet.EFCore.pdb" target="lib\net8.0" />
+    <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.dll" target="lib\net10.0" />
+    <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.pdb" target="lib\net10.0" />
     
     <!-- Chet.QuartzNet.EFCore.MySQL -->
-    <file src="bin\Release\net8.0\Chet.QuartzNet.EFCore.MySQL.dll" target="lib\net8.0" />
-    <file src="bin\Release\net8.0\Chet.QuartzNet.EFCore.MySQL.pdb" target="lib\net8.0" />
+    <file src="bin\Release\net10.0\Chet.QuartzNet.EFCore.MySQL.dll" target="lib\net10.0" />
+    <file src="bin\Release\net10.0\Chet.QuartzNet.EFCore.MySQL.pdb" target="lib\net10.0" />
     
     <!-- Chet.QuartzNet.EFCore .NET 10 -->
     <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.dll" target="lib\net10.0" />
