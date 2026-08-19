@@ -29,14 +29,8 @@ public static class ServiceCollectionExtensions
     {
         services.AddDbContext<QuartzDbContext>(options =>
         {
-            var mySqlServerVersion =
-                serverVersion != null
-                    ? MySqlServerVersion.Parse(serverVersion)
-                    : MySqlServerVersion.AutoDetect(connectionString);
-
-            options.UseMySql(
+            options.UseMySQL(
                 connectionString,
-                mySqlServerVersion,
                 mySqlOptions =>
                 {
                     mySqlOptions.MaxBatchSize(1);

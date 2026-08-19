@@ -16,7 +16,7 @@ public class DesignTimeDbContextFactory : IDesignTimeDbContextFactory<QuartzDbCo
 
         // 配置DbContext
         var optionsBuilder = new DbContextOptionsBuilder<QuartzDbContext>();
-        optionsBuilder.UseMySql(connectionString, ServerVersion.AutoDetect(connectionString), mySqlOptions =>
+        optionsBuilder.UseMySQL(connectionString, mySqlOptions =>
         {
             mySqlOptions.MigrationsAssembly("Chet.QuartzNet.EFCore.MySQL");
         });
