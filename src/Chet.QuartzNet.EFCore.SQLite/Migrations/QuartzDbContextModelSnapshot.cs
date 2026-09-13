@@ -15,7 +15,7 @@ namespace Chet.QuartzNet.EFCore.SQLite.Migrations
         protected override void BuildModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
-            modelBuilder.HasAnnotation("ProductVersion", "8.0.0");
+            modelBuilder.HasAnnotation("ProductVersion", "8.0.23");
 
             modelBuilder.Entity("Chet.QuartzNet.Models.Entities.QuartzJobInfo", b =>
                 {
@@ -109,11 +109,29 @@ namespace Chet.QuartzNet.EFCore.SQLite.Migrations
                         .HasColumnType("TEXT")
                         .HasComment("备注");
 
+                    b.Property<int>("RetryCount")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(0)
+                        .HasComment("失败重试次数(0=不重试)");
+
+                    b.Property<int>("RetryIntervalSeconds")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(30)
+                        .HasComment("失败重试间隔(秒)");
+
                     b.Property<bool>("SkipSslValidation")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER")
                         .HasDefaultValue(false)
                         .HasComment("是否跳过SSL验证");
+
+                    b.Property<bool>("DisallowConcurrentExecution")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(false)
+                        .HasComment("禁止并发执行");
 
                     b.Property<DateTime?>("StartTime")
                         .HasColumnType("TEXT")

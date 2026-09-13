@@ -11,10 +11,10 @@ public class DesignTimeDbContextFactory : IDesignTimeDbContextFactory<QuartzDbCo
 {
     public QuartzDbContext CreateDbContext(string[] args)
     {
-        // 直接硬编码连接字符串，仅用于生成迁移
+        // 直接硬编码连接字符串，仅用于生成迁移（不会真正连接）
         var connectionString = "Server=localhost;Database=quartzui;User=root;Password=123456;";
 
-        // 配置DbContext
+        // 配置DbContext（固定服务器版本，避免设计时探测连接）
         var optionsBuilder = new DbContextOptionsBuilder<QuartzDbContext>();
         optionsBuilder.UseMySQL(connectionString, mySqlOptions =>
         {

@@ -2,7 +2,7 @@
 <package >
 	<metadata>
 		<id>Chet.QuartzNet.UI</id>
-		<version>2.3.1</version>
+		<version>2.5.1</version>
 		<title>Chet.QuartzNet.UI</title>
 		<authors>Chet</authors>
 		<owners>Chet</owners>
@@ -28,18 +28,19 @@
 	</metadata>
 	<files>
     <!-- Chet.QuartzNet.UI -->
+    <!-- Chet.QuartzNet.UI .NET 10 -->
     <file src="bin\Release\net10.0\Chet.QuartzNet.UI.dll" target="lib\net10.0" />
     <file src="bin\Release\net10.0\Chet.QuartzNet.UI.pdb" target="lib\net10.0" />
     
-    <!-- Chet.QuartzNet.Core -->
+    <!-- Chet.QuartzNet.Core .NET 10 -->
     <file src="..\Chet.QuartzNet.Core\bin\Release\net10.0\Chet.QuartzNet.Core.dll" target="lib\net10.0" />
     <file src="..\Chet.QuartzNet.Core\bin\Release\net10.0\Chet.QuartzNet.Core.pdb" target="lib\net10.0" />
     
-    <!-- Chet.QuartzNet.Models -->
+    <!-- Chet.QuartzNet.Models .NET 10 -->
     <file src="..\Chet.QuartzNet.Models\bin\Release\net10.0\Chet.QuartzNet.Models.dll" target="lib\net10.0" />
     <file src="..\Chet.QuartzNet.Models\bin\Release\net10.0\Chet.QuartzNet.Models.pdb" target="lib\net10.0" />
     
-    <!-- Chet.QuartzNet.EFCore -->
+    <!-- Chet.QuartzNet.EFCore .NET 10 -->
     <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.dll" target="lib\net10.0" />
     <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.pdb" target="lib\net10.0" />
     

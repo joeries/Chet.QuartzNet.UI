@@ -33,11 +33,12 @@ export async function loadSystemConfig(): Promise<void> {
         environment: data?.environment || 'DEV',
         serviceDescription: data?.serviceDescription || '',
       };
+      // 仅成功时标记已加载，失败时允许后续重试（如 401 过期后重新登录）
+      loaded = true;
     } catch (error) {
-      // 静默失败，不影响主流程
+      // 静默失败，不影响主流程；loaded 保持 false，下次会重试
       console.error('加载系统配置失败', error);
     } finally {
-      loaded = true;
       loadingPromise = null;
     }
   })();

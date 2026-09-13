@@ -9,6 +9,7 @@ import { accessRoutes, coreRouteNames } from '#/router/routes';
 import { useAuthStore } from '#/store';
 
 import { generateAccess } from './access';
+import { loadSystemConfig } from '#/composables/use-system-config';
 
 /**
  * 通用守卫配置
@@ -107,6 +108,10 @@ function setupAccessGuard(router: Router) {
     accessStore.setAccessMenus(accessibleMenus);
     accessStore.setAccessRoutes(accessibleRoutes);
     accessStore.setIsAccessChecked(true);
+
+    // 登录后/部署后首次访问：异步加载系统配置（服务名用于标题/横幅，不阻塞路由）
+    loadSystemConfig();
+
     const redirectPath = (from.query.redirect ??
       (to.path === preferences.app.defaultHomePath
         ? userInfo.homePath || preferences.app.defaultHomePath

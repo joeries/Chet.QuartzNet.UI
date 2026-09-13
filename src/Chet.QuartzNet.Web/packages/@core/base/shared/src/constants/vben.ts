@@ -6,7 +6,7 @@ export const VBEN_GITHUB_URL = 'https://github.com/qiect/Chet.QuartzNet.UI';
 /**
  * @zh_CN 文档地址
  */
-export const VBEN_DOC_URL = 'https://github.com/qiect/Chet.QuartzNet.UI/tree/main/docs';
+export const VBEN_DOC_URL = 'https://qiect.github.io/Chet.QuartzNet.UI';
 
 /**
  * @zh_CN Vben Logo

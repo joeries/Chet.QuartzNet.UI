@@ -111,11 +111,29 @@ namespace Chet.QuartzNet.EFCore.MySQL.Migrations
                         .HasColumnType("varchar(500)")
                         .HasComment("备注");
 
+                    b.Property<int>("RetryCount")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int")
+                        .HasDefaultValue(0)
+                        .HasComment("失败重试次数(0=不重试)");
+
+                    b.Property<int>("RetryIntervalSeconds")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int")
+                        .HasDefaultValue(30)
+                        .HasComment("失败重试间隔(秒)");
+
                     b.Property<bool>("SkipSslValidation")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("tinyint(1)")
                         .HasDefaultValue(false)
                         .HasComment("是否跳过SSL验证");
+
+                    b.Property<bool>("DisallowConcurrentExecution")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("tinyint(1)")
+                        .HasDefaultValue(false)
+                        .HasComment("禁止并发执行");
 
                     b.Property<DateTime?>("StartTime")
                         .HasColumnType("datetime(6)")

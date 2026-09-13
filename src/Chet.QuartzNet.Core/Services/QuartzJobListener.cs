@@ -1,4 +1,4 @@
-using System.Text.Json;
+using Chet.QuartzNet.Core.Consts;
 using Chet.QuartzNet.Core.Helpers;
 using Chet.QuartzNet.Core.Interfaces;
 using Chet.QuartzNet.Models.Entities;
@@ -62,29 +62,40 @@ namespace Chet.QuartzNet.Core.Services
                     Result = context.Result?.ToString(),
                 };
 
+                // 判断是否手动触发
+                var isManualTrigger =
+                    context.MergedJobDataMap != null
+                    && context.MergedJobDataMap.TryGetValue("IsManualTrigger", out var manualFlag)
+                    && manualFlag is bool
+                    && (bool)manualFlag;
+                var triggerLabel = isManualTrigger ? "（手动触发）" : string.Empty;
+
                 // 处理执行结果
                 if (executionException == null)
                 {
                     jobLog.Status = LogStatus.Success;
-                    jobLog.Message = "作业执行成功";
+                    jobLog.Message = $"作业执行成功{triggerLabel}";
                 }
                 else
                 {
                     jobLog.Status = LogStatus.Failed;
-                    jobLog.Message = "作业执行失败";
+                    jobLog.Message = $"作业执行失败{triggerLabel}";
                     jobLog.Exception = executionException.ToString();
                     jobLog.ErrorMessage = executionException.Message;
                     jobLog.ErrorStackTrace = executionException.StackTrace;
                 }
 
-                // 记录作业数据
-                if (context.MergedJobDataMap != null && context.MergedJobDataMap.Count > 0)
+                // 记录作业数据：保存用户配置的原始 JSON，保证日志展示与配置一致
+                if (
+                    context.MergedJobDataMap != null
+                    && context.MergedJobDataMap.TryGetValue(
+                        QuartzJobConst.JobData,
+                        out var jobDataValue
+                    )
+                    && !string.IsNullOrEmpty(jobDataValue?.ToString())
+                )
                 {
-                    var jobDataDict = context.MergedJobDataMap.ToDictionary(
-                        kvp => kvp.Key,
-                        kvp => kvp.Value?.ToString()
-                    );
-                    jobLog.JobData = JsonSerializer.Serialize(jobDataDict);
+                    jobLog.JobData = jobDataValue.ToString();
                 }
 
                 // 创建作用域来解析IJobStorage

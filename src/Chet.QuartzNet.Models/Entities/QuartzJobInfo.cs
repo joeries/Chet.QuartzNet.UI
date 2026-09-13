@@ -88,9 +88,24 @@ public class QuartzJobInfo
     public int ApiTimeout { get; set; } = 60; // 默认60秒
 
     /// <summary>
+    /// 失败重试次数（0=不重试，默认关闭）
+    /// </summary>
+    public int RetryCount { get; set; } = 0;
+
+    /// <summary>
+    /// 失败重试间隔（秒）
+    /// </summary>
+    public int RetryIntervalSeconds { get; set; } = 30;
+
+    /// <summary>
     /// 跳过SSL验证
     /// </summary>
     public bool SkipSslValidation { get; set; } = false;
+
+    /// <summary>
+    /// 禁止并发执行（同一作业上一次执行未完成时，新的触发会等待）
+    /// </summary>
+    public bool DisallowConcurrentExecution { get; set; } = false;
 
     /// <summary>
     /// 开始时间

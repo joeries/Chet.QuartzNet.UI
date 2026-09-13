@@ -12,6 +12,7 @@ import { defineStore } from 'pinia';
 
 import { loginApi } from '#/api';
 import { $t } from '#/locales';
+import { resetSystemConfig } from '#/composables/use-system-config';
 
 export const useAuthStore = defineStore('auth', () => {
   const accessStore = useAccessStore();
@@ -99,6 +100,8 @@ export const useAuthStore = defineStore('auth', () => {
     // 清除所有store数据
     resetAllStores();
     accessStore.setLoginExpired(false);
+    // 重置系统配置加载状态，确保下次登录后会重新加载（标题/横幅）
+    resetSystemConfig();
 
     // 回登录页带上当前路由地址
     await router.replace({

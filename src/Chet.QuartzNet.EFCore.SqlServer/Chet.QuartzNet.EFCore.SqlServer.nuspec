@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
   <metadata>
     <id>Chet.QuartzNet.EFCore.SqlServer</id>
-    <version>2.3.1</version>
+    <version>2.5.1</version>
     <authors>Chet</authors>
     <description>Chet.QuartzNet.UI SQL Server 数据库支持</description>
     <tags>Quartz;Scheduler;EFCore;SqlServer</tags>
@@ -10,7 +10,7 @@
     <repository type="git" url="https://github.com/qiect/Chet.QuartzNet.UI" />
     <icon>icon.png</icon>
     <readme>README.md</readme>
-    <releaseNotes>https://github.com/qiect/Chet.QuartzNet.UI/releases/tag/2.3.1</releaseNotes>
+    <releaseNotes>https://github.com/qiect/Chet.QuartzNet.UI/releases/tag/2.5.1</releaseNotes>
     <dependencies>
       <group targetFramework=".NETCoreApp10.0">
         <dependency id="Microsoft.EntityFrameworkCore.SqlServer" version="10.0.7" exclude="Build,Analyzers" />
@@ -21,10 +21,11 @@
   </metadata>
   <files>
     <!-- Chet.QuartzNet.EFCore -->
+    <!-- Chet.QuartzNet.EFCore .NET 10 -->
     <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.dll" target="lib\net10.0" />
     <file src="..\Chet.QuartzNet.EFCore\bin\Release\net10.0\Chet.QuartzNet.EFCore.pdb" target="lib\net10.0" />
     
-    <!-- Chet.QuartzNet.EFCore.SqlServer -->
+    <!-- Chet.QuartzNet.EFCore.SqlServer .NET 10 -->
     <file src="bin\Release\net10.0\Chet.QuartzNet.EFCore.SqlServer.dll" target="lib\net10.0" />
     <file src="bin\Release\net10.0\Chet.QuartzNet.EFCore.SqlServer.pdb" target="lib\net10.0" />
     
