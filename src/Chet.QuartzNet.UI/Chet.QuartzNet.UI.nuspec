@@ -1,7 +1,7 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <package >
 	<metadata>
-		<id>Chet.QuartzNet.UI</id>
+		<id>Joeries.Chet.QuartzNet.UI</id>
 		<version>2.5.1</version>
 		<title>Chet.QuartzNet.UI</title>
 		<authors>Chet</authors>
