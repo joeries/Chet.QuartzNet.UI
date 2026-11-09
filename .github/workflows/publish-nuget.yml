@@ -89,7 +89,7 @@ jobs:
           sed -i "s/<version>.*<\/version>/<version>$VERSION<\/version>/g" src/Chet.QuartzNet.UI/Chet.QuartzNet.UI.nuspec
 
           # 验证更新结果
-          grep -A 3 "<id>Chet.QuartzNet.UI<\/id>" src/Chet.QuartzNet.UI/Chet.QuartzNet.UI.nuspec
+          grep -A 3 "<id>Chet.QuartzNet.UI.Joeries<\/id>" src/Chet.QuartzNet.UI/Chet.QuartzNet.UI.nuspec
 
       # 3.2 Update database storage packages nuspec files
       - name: Update database storage packages nuspec version
