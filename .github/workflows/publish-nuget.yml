@@ -9,7 +9,7 @@ on:
       version:
         description: 'NuGet Package Version'
         required: true
-        default: '1.0.0'
+        default: '2.6.0.1'
 
 permissions:
   contents: read
@@ -24,10 +24,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      #- name: Setup .NET 8.0
-      #  uses: actions/setup-dotnet@v4
-      #  with:
-      #    dotnet-version: 8.0.x
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
 
       - name: Setup .NET 10.0
         uses: actions/setup-dotnet@v4
