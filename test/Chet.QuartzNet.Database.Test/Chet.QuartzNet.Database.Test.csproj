@@ -7,11 +7,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!--<PackageReference Include="Chet.QuartzNet.EFCore.MySQL" Version="2.1.0" />-->
-    <!--<PackageReference Include="Chet.QuartzNet.EFCore.PostgreSQL" Version="2.1.0" />-->
-    <PackageReference Include="Chet.QuartzNet.EFCore.SQLite" Version="2.1.0" />
-    <!--<PackageReference Include="Chet.QuartzNet.EFCore.SqlServer" Version="2.1.0" />-->
-    <PackageReference Include="Chet.QuartzNet.UI" Version="2.1.0" />
+    <!--<PackageReference Include="Chet.QuartzNet.EFCore.MySQL.Joeries" Version="2.6.0.1" />-->
+    <!--<PackageReference Include="Chet.QuartzNet.EFCore.PostgreSQL.Joeries" Version="2.6.0.1" />-->
+    <PackageReference Include="Chet.QuartzNet.EFCore.SQLite.Joeries" Version="2.6.0.1" />
+    <!--<PackageReference Include="Chet.QuartzNet.EFCore.SqlServer.Joeries" Version="2.6.0.1" />-->
+    <PackageReference Include="Chet.QuartzNet.UI.Joeries" Version="2.6.0.1" />
   </ItemGroup>
 
 </Project>

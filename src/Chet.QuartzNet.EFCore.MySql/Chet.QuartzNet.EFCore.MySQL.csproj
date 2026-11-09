@@ -1,11 +1,11 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net10.0</TargetFrameworks>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Chet.QuartzNet.EFCore.MySQL</PackageId>
-    <Version>2.5.1</Version>
+    <Version>2.6.0.1</Version>
     <Authors>Chet</Authors>
     <Description>Chet.QuartzNet.UI MySQL 数据库支持</Description>
     <PackageTags>Quartz;Scheduler;EFCore;MySQL</PackageTags>

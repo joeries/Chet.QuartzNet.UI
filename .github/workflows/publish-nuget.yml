@@ -1,4 +1,4 @@
-name: Build and Publish NuGet Packages
+name: Publish NuGet Packages
 
 on:
   release:
@@ -11,12 +11,14 @@ on:
         required: true
         default: '1.0.0'
 
+permissions:
+  contents: read
+  # Trusted Publishing 需要 GitHub OIDC 令牌
+  id-token: write
+
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write  # enable GitHub OIDC token issuance for this job
     steps:
       # 1. 代码检查与依赖安装
       - name: Checkout code
@@ -73,37 +75,34 @@ jobs:
           else
             VERSION=${{ github.event.inputs.version }}
           fi
-          
+
+          # 移除版本号中的 v 前缀（如果存在）
+          VERSION=${VERSION#v}
+
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
       # 3.1 Update nuspec file version
       - name: Update nuspec version
         run: |
-          # 移除版本号中的 v 前缀（如果存在）
-          VERSION=${VERSION#v}
-          
           # 使用 sed 命令更新 nuspec 文件中的版本号
           sed -i "s/<version>.*<\/version>/<version>$VERSION<\/version>/g" src/Chet.QuartzNet.UI/Chet.QuartzNet.UI.nuspec
-          
+
           # 验证更新结果
           grep -A 3 "<id>Chet.QuartzNet.UI<\/id>" src/Chet.QuartzNet.UI/Chet.QuartzNet.UI.nuspec
 
       # 3.2 Update database storage packages nuspec files
       - name: Update database storage packages nuspec version
         run: |
-          # 移除版本号中的 v 前缀（如果存在）
-          VERSION=${VERSION#v}
-          
           # 更新MySQL包nuspec
           sed -i "s/<version>.*<\/version>/<version>$VERSION<\/version>/g" src/Chet.QuartzNet.EFCore.MySql/Chet.QuartzNet.EFCore.MySQL.nuspec
-          
+
           # 更新PostgreSQL包nuspec
           sed -i "s/<version>.*<\/version>/<version>$VERSION<\/version>/g" src/Chet.QuartzNet.EFCore.PostgreSql/Chet.QuartzNet.EFCore.PostgreSQL.nuspec
-          
+
           # 更新SQLite包nuspec
           sed -i "s/<version>.*<\/version>/<version>$VERSION<\/version>/g" src/Chet.QuartzNet.EFCore.SQLite/Chet.QuartzNet.EFCore.SQLite.nuspec
-          
+
           # 更新SqlServer包nuspec
           sed -i "s/<version>.*<\/version>/<version>$VERSION<\/version>/g" src/Chet.QuartzNet.EFCore.SqlServer/Chet.QuartzNet.EFCore.SqlServer.nuspec
 
@@ -119,29 +118,29 @@ jobs:
         run: dotnet build src/Chet.QuartzNet.EFCore.MySql/Chet.QuartzNet.EFCore.MySQL.csproj --configuration Release
       - name: Pack MySQL package
         run: dotnet pack src/Chet.QuartzNet.EFCore.MySql/Chet.QuartzNet.EFCore.MySQL.csproj --configuration Release --output ./artifacts
-      
+
       - name: Build PostgreSQL package
         run: dotnet build src/Chet.QuartzNet.EFCore.PostgreSql/Chet.QuartzNet.EFCore.PostgreSQL.csproj --configuration Release
       - name: Pack PostgreSQL package
         run: dotnet pack src/Chet.QuartzNet.EFCore.PostgreSql/Chet.QuartzNet.EFCore.PostgreSQL.csproj --configuration Release --output ./artifacts
-      
+
       - name: Build SQLite package
         run: dotnet build src/Chet.QuartzNet.EFCore.SQLite/Chet.QuartzNet.EFCore.SQLite.csproj --configuration Release
       - name: Pack SQLite package
         run: dotnet pack src/Chet.QuartzNet.EFCore.SQLite/Chet.QuartzNet.EFCore.SQLite.csproj --configuration Release --output ./artifacts
-      
+
       - name: Build SqlServer package
         run: dotnet build src/Chet.QuartzNet.EFCore.SqlServer/Chet.QuartzNet.EFCore.SqlServer.csproj --configuration Release
       - name: Pack SqlServer package
         run: dotnet pack src/Chet.QuartzNet.EFCore.SqlServer/Chet.QuartzNet.EFCore.SqlServer.csproj --configuration Release --output ./artifacts
 
-      # Get a short-lived NuGet API key
+      # 6. NuGet 包发布（Trusted Publishing：用 OIDC 换取临时 API Key，无需长期密钥）
       - name: NuGet login (OIDC → temp API key)
+        id: nuget-login
         uses: NuGet/login@v1
-        id: login
         with:
-          user: ${{ secrets.NUGET_USER }} # Recommended: use a secret like ${{ secrets.NUGET_USER }} for your nuget.org username (profile name), NOT your email address
+          # nuget.org 用户名（个人资料名），不是邮箱
+          user: ${{ secrets.NUGET_USER }}
 
-      # 6. NuGet 包发布
-      - name: Publish NuGet packages (API Key)
-        run: dotnet nuget push ./artifacts/*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{steps.login.outputs.NUGET_API_KEY}} --skip-duplicate
+      - name: Publish NuGet packages
+        run: dotnet nuget push ./artifacts/*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }} --skip-duplicate
