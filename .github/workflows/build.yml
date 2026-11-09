@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write  # enable GitHub OIDC token issuance for this job
     steps:
       # 1. 代码检查与依赖安装
       - name: Checkout code
@@ -134,6 +135,13 @@ jobs:
       - name: Pack SqlServer package
         run: dotnet pack src/Chet.QuartzNet.EFCore.SqlServer/Chet.QuartzNet.EFCore.SqlServer.csproj --configuration Release --output ./artifacts
 
+      # Get a short-lived NuGet API key
+      - name: NuGet login (OIDC → temp API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }} # Recommended: use a secret like ${{ secrets.NUGET_USER }} for your nuget.org username (profile name), NOT your email address
+
       # 6. NuGet 包发布
       - name: Publish NuGet packages (API Key)
-        run: dotnet nuget push ./artifacts/*.nupkg --source https://dev.uu163yun.com/ngs/nuget --api-key ${{ secrets.NUGET_API_KEY }} --skip-duplicate
+        run: dotnet nuget push ./artifacts/*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{steps.login.outputs.NUGET_API_KEY}} --skip-duplicate

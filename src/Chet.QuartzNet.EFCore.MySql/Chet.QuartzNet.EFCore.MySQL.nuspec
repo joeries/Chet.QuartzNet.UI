@@ -4,7 +4,7 @@
     <id>Chet.QuartzNet.EFCore.MySQL.Joeries</id>
     <version>2.5.1</version>
     <authors>Chet</authors>
-    <description>Chet.QuartzNet.UI MySQL 数据库支持</description>
+    <description>Chet.QuartzNet.UI MySQL 数据库支持；EF Core MySQL 驱动替换为 MySql.EntityFrameworkCore 。</description>
     <tags>Quartz;Scheduler;EFCore;MySQL</tags>
     <projectUrl>https://qiect.github.io/Chet.QuartzNet.UI</projectUrl>
     <repository type="git" url="https://github.com/qiect/Chet.QuartzNet.UI" />
