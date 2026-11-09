@@ -23,13 +23,9 @@ public sealed class MySqlMigrationProvider : IQuartzMigrationProvider
     )
     {
         var builder = new DbContextOptionsBuilder<QuartzDbContext>();
-        var version = string.IsNullOrWhiteSpace(serverVersion)
-            ? MySqlServerVersion.AutoDetect(connectionString)
-            : MySqlServerVersion.Parse(serverVersion);
 
-        builder.UseMySql(
+        builder.UseMySQL(
             connectionString,
-            version,
             options => options.MigrationsAssembly("Chet.QuartzNet.EFCore.MySQL")
         );
 
