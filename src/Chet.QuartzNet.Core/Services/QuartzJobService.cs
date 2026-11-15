@@ -3,6 +3,8 @@ using Chet.QuartzNet.Core.Consts;
 using Chet.QuartzNet.Core.Helpers;
 using Chet.QuartzNet.Core.Interfaces;
 using Chet.QuartzNet.Core.Jobs;
+using Chet.QuartzNet.Core.Recovery;
+using Chet.QuartzNet.Core.Scheduling;
 using Chet.QuartzNet.Models.DTOs;
 using Chet.QuartzNet.Models.Entities;
 using Microsoft.Extensions.Logging;
@@ -19,14 +21,74 @@ namespace Chet.QuartzNet.Core.Services;
 public class QuartzJobService : IQuartzJobService
 {
     /// <summary>
-    /// 调度器实例
+    /// 当前调度器实例（首次使用时从进程内缓存取，必要时才向工厂申请新实例）
     /// </summary>
-    private IScheduler _scheduler;
+    private IScheduler? _scheduler;
+
+    /// <summary>
+    /// 调度器实例。
+    /// Quartz 关闭调度器后会把它从实例仓库移除，此时直接调用
+    /// ISchedulerFactory.GetScheduler 会隐式创建一个「从未启动」的新实例，
+    /// 使已停止的调度器显示成「待机」。这里统一复用进程内缓存的当前实例。
+    /// </summary>
+    private IScheduler Scheduler =>
+        _scheduler
+        ?? _schedulerInstance.Current
+        ?? throw new InvalidOperationException("调度器实例尚未初始化，请先启动调度器");
+
+    /// <summary>
+    /// 确保调度器实例已创建。
+    /// 只用于启动等确实需要实例的异步流程，
+    /// 避免在属性 getter 中通过 GetAwaiter().GetResult() 同步等待异步创建。
+    /// </summary>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>调度器实例</returns>
+    private async Task<IScheduler> EnsureSchedulerAsync(CancellationToken cancellationToken)
+    {
+        if (_scheduler is not null)
+        {
+            return _scheduler;
+        }
+
+        var current = _schedulerInstance.Current;
+        if (current is not null)
+        {
+            _scheduler = current;
+            return current;
+        }
+
+        // 从未创建过实例（例如启动早期），这里按需创建一次并缓存
+        var created = await _schedulerInstance.GetSchedulerAsync(
+            _schedulerFactory,
+            cancellationToken
+        );
+        _scheduler = created;
+        return created;
+    }
+
+    /// <summary>
+    /// 调度器是否可用（未关闭）。
+    /// 调度器关闭后 Quartz 的所有调度 API 都会抛 <see cref="SchedulerException"/>，
+    /// 因此作业管理类操作必须先判断，再决定是否操作调度器，避免存储侧操作被连带阻断。
+    /// </summary>
+    private bool IsSchedulerAvailable
+    {
+        get
+        {
+            var scheduler = _schedulerInstance.Current ?? _scheduler;
+            return scheduler is not null && !scheduler.IsShutdown;
+        }
+    }
 
     /// <summary>
     /// 调度器工厂
     /// </summary>
     private readonly ISchedulerFactory _schedulerFactory;
+
+    /// <summary>
+    /// 进程内当前调度器实例持有者
+    /// </summary>
+    private readonly SchedulerInstance _schedulerInstance;
 
     /// <summary>
     /// 作业存储接口
@@ -53,6 +115,12 @@ public class QuartzJobService : IQuartzJobService
     /// </summary>
     private readonly INotificationService _notificationService;
 
+    private readonly DrainCoordinator _drainCoordinator;
+    private readonly RecoveryCoordinator _recoveryCoordinator;
+    private readonly RecoverySummaryStore _recoverySummary;
+    private readonly RecoveryOptionsProvider _recoveryOptions;
+    private readonly RuntimeInstance _runtimeInstance;
+
     /// <summary>
     /// 初始化QuartzJobService实例
     /// </summary>
@@ -62,22 +130,41 @@ public class QuartzJobService : IQuartzJobService
     /// <param name="options">Quartz UI配置选项</param>
     /// <param name="jobClassScanner">作业类扫描器</param>
     /// <param name="notificationService">通知服务</param>
+    /// <param name="drainCoordinator">排水协调器</param>
+    /// <param name="recoveryCoordinator">恢复协调器</param>
+    /// <param name="recoverySummary">恢复汇总</param>
+    /// <param name="recoveryOptions">启动期配置快照</param>
+    /// <param name="runtimeInstance">运行实例信息</param>
+    /// <param name="schedulerInstance">进程内当前调度器实例持有者</param>
     public QuartzJobService(
         ISchedulerFactory schedulerFactory,
         IJobStorage jobStorage,
         ILogger<QuartzJobService> logger,
         IOptions<QuartzUIOptions> options,
         JobClassScanner jobClassScanner,
-        INotificationService notificationService
+        INotificationService notificationService,
+        DrainCoordinator drainCoordinator,
+        RecoveryCoordinator recoveryCoordinator,
+        RecoverySummaryStore recoverySummary,
+        RecoveryOptionsProvider recoveryOptions,
+        RuntimeInstance runtimeInstance,
+        SchedulerInstance schedulerInstance
     )
     {
         _schedulerFactory = schedulerFactory;
-        _scheduler = _schedulerFactory.GetScheduler().Result;
+        _schedulerInstance = schedulerInstance;
+        // 复用进程内已有实例：状态查询等只读场景不能因为工厂隐式创建而"复活"已关闭的调度器
+        _scheduler = schedulerInstance.Current;
         _jobStorage = jobStorage;
         _logger = logger;
         _options = options.Value;
         _jobClassScanner = jobClassScanner;
         _notificationService = notificationService;
+        _drainCoordinator = drainCoordinator;
+        _recoveryCoordinator = recoveryCoordinator;
+        _recoverySummary = recoverySummary;
+        _recoveryOptions = recoveryOptions;
+        _runtimeInstance = runtimeInstance;
     }
 
     #region 调度器
@@ -92,34 +179,61 @@ public class QuartzJobService : IQuartzJobService
     {
         try
         {
+            // 只读状态必须使用进程内缓存的实例：调度器关闭后 Quartz 会移除该实例，
+            // 此时向工厂索取会静默创建「从未启动」的新实例，把「已停止」显示成「待机」。
+            // 只有在从未创建过实例时才按需创建一次（异步创建，不再同步阻塞）
+            var scheduler = _schedulerInstance.Current ?? await EnsureSchedulerAsync(cancellationToken);
+
+            // Quartz 关闭后 IsStarted 仍可能为 true，这里统一以「已关闭」为准，
+            // 否则前端会既不显示「启动调度器」又禁用了排水/停止，陷入无法操作的死状态
+            var isShutdown = scheduler.IsShutdown;
+
             var status = new SchedulerStatusDto
             {
-                SchedulerName = _scheduler.SchedulerName,
-                SchedulerInstanceId = _scheduler.SchedulerInstanceId,
-                IsStarted = _scheduler.IsStarted,
-                IsShutdown = _scheduler.IsShutdown,
-                InStandbyMode = _scheduler.InStandbyMode,
-                Status = GetSchedulerStatus(),
+                SchedulerName = scheduler.SchedulerName,
+                SchedulerInstanceId = scheduler.SchedulerInstanceId,
+                RuntimeInstanceId = _runtimeInstance.InstanceId,
+                IsStarted = !isShutdown && scheduler.IsStarted,
+                IsShutdown = isShutdown,
+                InStandbyMode = !isShutdown && scheduler.InStandbyMode,
+                Status = GetStatusText(scheduler),
+                ShutdownMode = _recoveryOptions.Current.ShutdownMode,
+                // 线程池容量：优先取调度器元数据中的真实值（配置可能被宿主覆盖）
                 ThreadPoolSize = _options.ThreadPoolSize,
                 Version = typeof(IScheduler).Assembly.GetName().Version?.ToString() ?? "Unknown",
             };
 
             // 如果调度器已停止，避免调用会抛出异常的方法
-            if (!_scheduler.IsShutdown)
+            if (!scheduler.IsShutdown)
             {
-                // 从调度器元数据获取真实启动时间，IScheduler 上没有 StartTime 属性
-                var metadata = await _scheduler.GetMetaData(cancellationToken);
-                status.StartTime = metadata.RunningSince?.LocalDateTime;
+                // 调度器可能正处于待机/关闭过程中，单条查询失败不应让整个状态接口失败，
+                // 否则前端会一直停留在上一次的「排水」状态上刷新不出来
+                try
+                {
+                    // 从调度器元数据获取真实启动时间，IScheduler 上没有 StartTime 属性
+                    var metadata = await scheduler.GetMetaData(cancellationToken);
+                    status.StartTime = metadata.RunningSince?.LocalDateTime;
 
-                var jobKeys = await _scheduler.GetJobKeys(
-                    GroupMatcher<JobKey>.AnyGroup(),
-                    cancellationToken
-                );
-                var currentlyExecuting = await _scheduler.GetCurrentlyExecutingJobs(
-                    cancellationToken
-                );
-                status.JobCount = jobKeys.Count;
-                status.ExecutingJobCount = currentlyExecuting.Count;
+                    // 以调度器实际线程池容量为准，配置项只作为兜底
+                    if (metadata.ThreadPoolSize > 0)
+                    {
+                        status.ThreadPoolSize = metadata.ThreadPoolSize;
+                    }
+
+                    var jobKeys = await scheduler.GetJobKeys(
+                        GroupMatcher<JobKey>.AnyGroup(),
+                        cancellationToken
+                    );
+                    var currentlyExecuting = await scheduler.GetCurrentlyExecutingJobs(
+                        cancellationToken
+                    );
+                    status.JobCount = jobKeys.Count;
+                    status.ExecutingJobCount = currentlyExecuting.Count;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarn("获取调度器实时状态", $"部分状态获取失败: {ex.Message}");
+                }
             }
             else
             {
@@ -132,6 +246,22 @@ public class QuartzJobService : IQuartzJobService
             {
                 status.RunningTime = (long)
                     (DateTime.Now - status.StartTime.Value).TotalMilliseconds;
+            }
+
+            status.IsDraining = _drainCoordinator.IsDraining;
+            status.IsStopping = _drainCoordinator.IsStopping;
+            status.DrainStartedAt = _drainCoordinator.StartedAt;
+            status.DrainDeadline = _drainCoordinator.Deadline;
+            status.RemainingExecutingCount = status.IsDraining
+                ? _drainCoordinator.RemainingExecutingCount
+                : 0;
+            status.PendingCompensationCount = _recoverySummary.Snapshot().PendingCount;
+
+            // 排水流程优先描述状态：否则关闭调度器的瞬间会显示成「待机」，
+            // 与正在进行中的排水相互矛盾
+            if (status.IsDraining)
+            {
+                status.Status = status.IsStopping ? "正在停止" : "排水";
             }
 
             return ApiResponseDto<SchedulerStatusDto>.SuccessResponse(status);
@@ -156,21 +286,50 @@ public class QuartzJobService : IQuartzJobService
     {
         try
         {
-            if (_scheduler.IsShutdown)
+            // 调度器实例可能尚未创建（例如启动早期或初始化失败），先按需创建
+            await EnsureSchedulerAsync(cancellationToken);
+
+            if (Scheduler.IsShutdown)
             {
-                // 如果调度器已关闭，重新创建调度器实例
-                _scheduler = await _schedulerFactory.GetScheduler(cancellationToken);
+                // 如果调度器已关闭，重新创建调度器实例（关闭后原实例已从 Quartz 仓库移除）
+                var recreated = await _schedulerFactory.GetScheduler(cancellationToken);
+                _scheduler = recreated;
+                _schedulerInstance.Set(recreated);
                 _logger.LogInfoStructured("重新创建调度器实例");
             }
 
-            if (!_scheduler.IsStarted)
+            // Quartz 的 IsStarted 在「待机」状态下依然为 true，
+            // 因此必须同时判断 InStandbyMode，否则从待机恢复时不会真正调用 Start
+            if (!Scheduler.IsStarted || Scheduler.InStandbyMode)
             {
-                await _scheduler.Start(cancellationToken);
+                await Scheduler.Start(cancellationToken);
                 _logger.LogSuccess("启动调度器");
             }
 
+            // 调度器已重新运行，清空上一次排水留下的阶段，避免状态卡片停留在「排水」语义上
+            _drainCoordinator.Reset();
+
             // 重新加载所有正常状态的作业到调度器
             await ReloadNormalJobsAsync(cancellationToken);
+
+            // 启动前若还有待补偿记录（上次调度器未启动导致跳过），补跑一次恢复流程
+            if (_recoverySummary.Snapshot().PendingCount > 0)
+            {
+                _ = Task.Run(
+                    async () =>
+                    {
+                        try
+                        {
+                            await _recoveryCoordinator.RunAsync(CancellationToken.None);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "调度器启动后的补偿流程失败");
+                        }
+                    },
+                    CancellationToken.None
+                );
+            }
 
             return ApiResponseDto<bool>.SuccessResponse(true, "调度器启动成功");
         }
@@ -185,9 +344,13 @@ public class QuartzJobService : IQuartzJobService
     /// 重新加载所有正常状态的作业到调度器
     /// </summary>
     /// <param name="cancellationToken">取消令牌</param>
-    /// <returns>任务</returns>
-    private async Task ReloadNormalJobsAsync(CancellationToken cancellationToken = default)
+    /// <returns>成功与失败的作业数量</returns>
+    private async Task<(int Loaded, int Failed)> ReloadNormalJobsAsync(
+        CancellationToken cancellationToken = default
+    )
     {
+        var loaded = 0;
+        var failed = 0;
         try
         {
             // 获取所有存储的作业
@@ -200,7 +363,7 @@ public class QuartzJobService : IQuartzJobService
                 {
                     // 检查作业是否已经有触发器
                     var jobKey = new JobKey(jobInfo.JobName, jobInfo.JobGroup);
-                    var triggers = await _scheduler.GetTriggersOfJob(jobKey, cancellationToken);
+                    var triggers = await Scheduler.GetTriggersOfJob(jobKey, cancellationToken);
 
                     if (triggers.Any())
                     {
@@ -234,6 +397,7 @@ public class QuartzJobService : IQuartzJobService
 
                     // 重新调度作业
                     await ScheduleJobAsync(jobInfo, cancellationToken);
+                    loaded++;
                     _logger.LogSuccess(
                         "ReloadNormalJobs",
                         $"作业 {jobInfo.JobGroup}.{jobInfo.JobName} 重新加载成功"
@@ -241,6 +405,7 @@ public class QuartzJobService : IQuartzJobService
                 }
                 catch (Exception ex)
                 {
+                    failed++;
                     _logger.LogError(
                         ex,
                         "重新加载作业失败: {JobKey}",
@@ -250,12 +415,46 @@ public class QuartzJobService : IQuartzJobService
                 }
             }
 
-            _logger.LogSuccess("ReloadNormalJobs", "作业重新加载完成");
+            _logger.LogSuccess(
+                "ReloadNormalJobs",
+                $"作业重新加载完成：成功 {loaded} 个，失败 {failed} 个"
+            );
         }
         catch (Exception ex)
         {
             _logger.LogFailure("ReloadNormalJobs", ex);
+            return (loaded, Math.Max(failed, 1));
         }
+
+        return (loaded, failed);
+    }
+
+    /// <summary>
+    /// 把存储中启用且未暂停的作业重新加载到调度器
+    /// </summary>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>操作结果</returns>
+    public async Task<ApiResponseDto<bool>> ReloadJobsAsync(
+        CancellationToken cancellationToken = default
+    )
+    {
+        // 允许在从未创建过实例时按需创建（启动早期），但已关闭的调度器不再复活
+        var scheduler = await EnsureSchedulerAsync(cancellationToken);
+        if (scheduler.IsShutdown)
+        {
+            return ApiResponseDto<bool>.ErrorResponse(
+                "调度器已停止，无法重新加载作业，请先启动调度器",
+                "SCHEDULER_NOT_RUNNING"
+            );
+        }
+
+        var (loaded, failed) = await ReloadNormalJobsAsync(cancellationToken);
+        return failed > 0
+            ? ApiResponseDto<bool>.SuccessResponse(
+                false,
+                $"作业重新加载完成：成功 {loaded} 个，失败 {failed} 个"
+            )
+            : ApiResponseDto<bool>.SuccessResponse(true, $"作业重新加载完成：成功 {loaded} 个");
     }
 
     /// <summary>
@@ -269,9 +468,16 @@ public class QuartzJobService : IQuartzJobService
     {
         try
         {
-            if (!_scheduler.IsShutdown)
+            if (!Scheduler.IsShutdown)
             {
-                await _scheduler.Shutdown(cancellationToken);
+                // 直接停止等同于立即停止：Shutdown 会中断执行中的任务，
+                // 必须在关闭前把残留执行标记为中断，否则监听器来不及收尾，
+                // 日志会永久停留在「运行中」并一直读秒
+                await _drainCoordinator.MarkActiveExecutionsInterruptedAsync(
+                    "调度器被手动停止，执行未正常完成"
+                );
+
+                await Scheduler.Shutdown(cancellationToken);
                 _logger.LogSuccess("ShutdownScheduler");
             }
 
@@ -285,16 +491,62 @@ public class QuartzJobService : IQuartzJobService
     }
 
     /// <summary>
+    /// 排水：停止接收新触发，等待执行中任务收尾后自动停止
+    /// </summary>
+    public Task<ApiResponseDto<bool>> DrainSchedulerAsync(
+        int? timeoutSeconds = null,
+        CancellationToken cancellationToken = default
+    )
+    {
+        return _drainCoordinator.BeginAsync(timeoutSeconds, cancellationToken);
+    }
+
+    /// <summary>
+    /// 取消排水并恢复调度
+    /// </summary>
+    public Task<ApiResponseDto<bool>> ResumeSchedulerAsync(
+        CancellationToken cancellationToken = default
+    )
+    {
+        return _drainCoordinator.ResumeAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// 获取本次启动的中断恢复汇总
+    /// </summary>
+    public Task<ApiResponseDto<RecoverySummaryDto>> GetRecoverySummaryAsync(
+        CancellationToken cancellationToken = default
+    )
+    {
+        return Task.FromResult(
+            ApiResponseDto<RecoverySummaryDto>.SuccessResponse(_recoverySummary.Snapshot())
+        );
+    }
+
+    /// <summary>
+    /// 手动重新执行一条中断日志
+    /// </summary>
+    public Task<ApiResponseDto<bool>> RerunInterruptedLogAsync(
+        Guid logId,
+        string? triggeredBy = null,
+        CancellationToken cancellationToken = default
+    )
+    {
+        return _recoveryCoordinator.RerunAsync(logId, triggeredBy, cancellationToken);
+    }
+
+    /// <summary>
     /// 获取调度器状态的中文描述
     /// </summary>
+    /// <param name="scheduler">调度器实例</param>
     /// <returns>调度器状态描述</returns>
-    private string GetSchedulerStatus()
+    private static string GetStatusText(IScheduler scheduler)
     {
-        if (_scheduler.IsShutdown)
+        if (scheduler.IsShutdown)
             return "已停止";
-        if (_scheduler.InStandbyMode)
+        if (scheduler.InStandbyMode)
             return "待机";
-        if (_scheduler.IsStarted)
+        if (scheduler.IsStarted)
             return "运行中";
         return "未知";
     }
@@ -380,6 +632,7 @@ public class QuartzJobService : IQuartzJobService
                 RetryIntervalSeconds = jobDto.RetryIntervalSeconds,
                 SkipSslValidation = jobDto.SkipSslValidation,
                 DisallowConcurrentExecution = jobDto.DisallowConcurrentExecution,
+                RerunOnRecovery = jobDto.RerunOnRecovery,
                 Dependencies = JobDependencyHelper.Serialize(jobDto.Dependencies),
                 StartTime = jobDto.StartTime,
                 EndTime = jobDto.EndTime,
@@ -395,10 +648,36 @@ public class QuartzJobService : IQuartzJobService
                 return ApiResponseDto<bool>.ErrorResponse("保存作业信息失败");
             }
 
-            // 如果启用，则立即调度作业
+            // 调度器已停止：只保存配置，启动调度器后会由重新加载流程接管
+            if (!IsSchedulerAvailable)
+            {
+                _logger.LogWarn("AddJob", $"调度器未运行，作业仅保存未调度: {jobInfo.GetJobKey()}");
+                return ApiResponseDto<bool>.SuccessResponse(
+                    true,
+                    "作业已保存，调度器未运行，启动调度器后将自动加载"
+                );
+            }
+
+            // 如果启用，则立即调度作业；调度失败必须回滚存储，
+            // 否则会留下「已保存但永远不会触发」的脏数据，用户重试还会提示作业已存在
             if (jobDto.IsEnabled)
             {
-                await ScheduleJobAsync(jobInfo, cancellationToken);
+                try
+                {
+                    await ScheduleJobAsync(jobInfo, cancellationToken);
+                }
+                catch (Exception scheduleEx)
+                {
+                    await _jobStorage.DeleteJobAsync(
+                        jobInfo.JobName,
+                        jobInfo.JobGroup,
+                        CancellationToken.None
+                    );
+                    _logger.LogFailure("AddJob", scheduleEx);
+                    return ApiResponseDto<bool>.ErrorResponse(
+                        $"添加作业失败，作业未能加入调度器: {scheduleEx.Message}"
+                    );
+                }
             }
 
             _logger.LogSuccess("AddJob", jobInfo.GetJobKey());
@@ -463,59 +742,80 @@ public class QuartzJobService : IQuartzJobService
             // 保存原作业状态
             var originalStatus = existingJob.Status;
 
+            // 调度器已停止：只更新存储，启动调度器后会由重新加载流程接管
+            if (!IsSchedulerAvailable)
+            {
+                ApplyJobDto(existingJob, jobDto);
+                if (!jobDto.IsEnabled)
+                {
+                    // 禁用后不再有下次执行时间，避免列表显示无效的「下次执行时间」
+                    existingJob.NextRunTime = null;
+                }
+
+                if (!await _jobStorage.UpdateJobAsync(existingJob, cancellationToken))
+                {
+                    return ApiResponseDto<bool>.ErrorResponse("更新作业信息失败");
+                }
+
+                _logger.LogWarn(
+                    "UpdateJob",
+                    $"调度器未运行，作业配置已保存: {existingJob.GetJobKey()}"
+                );
+                return ApiResponseDto<bool>.SuccessResponse(
+                    true,
+                    "作业已更新，调度器未运行，启动调度器后将自动生效"
+                );
+            }
+
             // 删除现有的作业调度
             var jobKey = new JobKey(jobDto.JobName, jobDto.JobGroup);
             var triggerKey = new TriggerKey(existingJob.TriggerName, existingJob.TriggerGroup);
 
-            await _scheduler.PauseJob(jobKey, cancellationToken);
-            await _scheduler.UnscheduleJob(triggerKey, cancellationToken);
-            await _scheduler.DeleteJob(jobKey, cancellationToken);
+            await Scheduler.PauseJob(jobKey, cancellationToken);
+            await Scheduler.UnscheduleJob(triggerKey, cancellationToken);
+            await Scheduler.DeleteJob(jobKey, cancellationToken);
 
-            // 更新作业信息，保留现有的触发器信息如果DTO中未提供
-            existingJob.TriggerName = string.IsNullOrWhiteSpace(jobDto.TriggerName)
-                ? existingJob.TriggerName
-                : jobDto.TriggerName;
-            existingJob.TriggerGroup = string.IsNullOrWhiteSpace(jobDto.TriggerGroup)
-                ? existingJob.TriggerGroup
-                : jobDto.TriggerGroup;
-            existingJob.CronExpression = jobDto.CronExpression;
-            existingJob.Description = jobDto.Description;
-            existingJob.JobType = jobDto.JobType;
-            existingJob.JobClassOrApi = jobDto.JobClassOrApi;
-            existingJob.JobData = jobDto.JobData;
-            existingJob.ApiMethod = jobDto.ApiMethod;
-            existingJob.ApiHeaders = jobDto.ApiHeaders;
-            existingJob.ApiBody = jobDto.ApiBody;
-            existingJob.ApiTimeout = jobDto.ApiTimeout;
-            existingJob.RetryCount = jobDto.RetryCount;
-            existingJob.RetryIntervalSeconds = jobDto.RetryIntervalSeconds;
-            existingJob.SkipSslValidation = jobDto.SkipSslValidation;
-            existingJob.DisallowConcurrentExecution = jobDto.DisallowConcurrentExecution;
-            existingJob.Dependencies = JobDependencyHelper.Serialize(jobDto.Dependencies);
-            existingJob.StartTime = jobDto.StartTime;
-            existingJob.EndTime = jobDto.EndTime;
-            existingJob.IsEnabled = jobDto.IsEnabled;
-            existingJob.UpdateTime = DateTime.Now;
+            ApplyJobDto(existingJob, jobDto);
 
-            // 保存更新
-            var updateResult = await _jobStorage.UpdateJobAsync(existingJob, cancellationToken);
-            if (!updateResult)
+            try
             {
-                return ApiResponseDto<bool>.ErrorResponse("更新作业信息失败");
-            }
-
-            // 如果启用，则重新调度作业
-            if (jobDto.IsEnabled)
-            {
-                await ScheduleJobAsync(existingJob, cancellationToken);
-
-                // 如果原作业是暂停状态，重新调度后保持暂停状态
-                if (originalStatus == JobStatus.Paused)
+                // 如果启用，则重新调度作业（ScheduleJobAsync 内部会持久化最新配置）
+                if (jobDto.IsEnabled)
                 {
-                    await _scheduler.PauseJob(jobKey, cancellationToken);
-                    existingJob.Status = JobStatus.Paused;
-                    await _jobStorage.UpdateJobAsync(existingJob, cancellationToken);
+                    await ScheduleJobAsync(existingJob, cancellationToken);
+
+                    // 如果原作业是暂停状态，重新调度后保持暂停状态
+                    if (originalStatus == JobStatus.Paused)
+                    {
+                        await Scheduler.PauseJob(jobKey, cancellationToken);
+                        existingJob.Status = JobStatus.Paused;
+                        existingJob.NextRunTime = null;
+                        await _jobStorage.UpdateJobAsync(existingJob, cancellationToken);
+                    }
                 }
+                else
+                {
+                    // 禁用后不再有下次执行时间，保持与 BatchSetEnabled 一致
+                    existingJob.NextRunTime = null;
+                    if (!await _jobStorage.UpdateJobAsync(existingJob, cancellationToken))
+                    {
+                        return ApiResponseDto<bool>.ErrorResponse("更新作业信息失败");
+                    }
+                }
+            }
+            catch (Exception scheduleEx)
+            {
+                // 重新调度失败：配置仍然落库，但置为禁用，
+                // 避免出现「存储中是启用状态、调度器里却没有触发器」的幽灵作业
+                existingJob.IsEnabled = false;
+                existingJob.NextRunTime = null;
+                existingJob.UpdateTime = DateTime.Now;
+                await _jobStorage.UpdateJobAsync(existingJob, CancellationToken.None);
+
+                _logger.LogFailure("UpdateJob", scheduleEx);
+                return ApiResponseDto<bool>.ErrorResponse(
+                    $"作业配置已保存，但重新调度失败，已自动置为禁用: {scheduleEx.Message}"
+                );
             }
 
             _logger.LogSuccess("UpdateJob", existingJob.GetJobKey());
@@ -525,6 +825,69 @@ public class QuartzJobService : IQuartzJobService
         {
             _logger.LogFailure("UpdateJob", ex);
             return ApiResponseDto<bool>.ErrorResponse($"更新作业失败: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 把 DTO 中的可编辑字段写入作业实体（不落库，由调用方决定持久化时机）
+    /// </summary>
+    /// <param name="job">作业实体</param>
+    /// <param name="jobDto">作业数据传输对象</param>
+    private static void ApplyJobDto(QuartzJobInfo job, QuartzJobDto jobDto)
+    {
+        // 保留现有的触发器信息（如果 DTO 中未提供）
+        job.TriggerName = string.IsNullOrWhiteSpace(jobDto.TriggerName)
+            ? job.TriggerName
+            : jobDto.TriggerName;
+        job.TriggerGroup = string.IsNullOrWhiteSpace(jobDto.TriggerGroup)
+            ? job.TriggerGroup
+            : jobDto.TriggerGroup;
+        job.CronExpression = jobDto.CronExpression;
+        job.Description = jobDto.Description;
+        job.JobType = jobDto.JobType;
+        job.JobClassOrApi = jobDto.JobClassOrApi;
+        job.JobData = jobDto.JobData;
+        job.ApiMethod = jobDto.ApiMethod;
+        job.ApiHeaders = jobDto.ApiHeaders;
+        job.ApiBody = jobDto.ApiBody;
+        job.ApiTimeout = jobDto.ApiTimeout;
+        job.RetryCount = jobDto.RetryCount;
+        job.RetryIntervalSeconds = jobDto.RetryIntervalSeconds;
+        job.SkipSslValidation = jobDto.SkipSslValidation;
+        job.DisallowConcurrentExecution = jobDto.DisallowConcurrentExecution;
+        job.RerunOnRecovery = jobDto.RerunOnRecovery;
+        job.Dependencies = JobDependencyHelper.Serialize(jobDto.Dependencies);
+        job.StartTime = jobDto.StartTime;
+        job.EndTime = jobDto.EndTime;
+        job.IsEnabled = jobDto.IsEnabled;
+        job.UpdateTime = DateTime.Now;
+    }
+
+    /// <summary>
+    /// 请求中断作业正在执行的实例（仅对实现 IInterruptableJob 的作业生效）。
+    /// 删除/禁用作业时必须调用：Quartz 的 DeleteJob 只移除作业定义，
+    /// 已在执行的实例会继续跑完，导致「执行中」计数和线程占用迟迟不释放。
+    /// </summary>
+    private async Task TryInterruptJobAsync(JobKey jobKey, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!await Scheduler.CheckExists(jobKey, cancellationToken))
+            {
+                return;
+            }
+
+            if (await Scheduler.Interrupt(jobKey, cancellationToken))
+            {
+                _logger.LogInfo("中断作业", $"已请求中断执行中的作业: {jobKey.Group}.{jobKey.Name}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarn(
+                "中断作业",
+                $"请求中断作业 {jobKey.Group}.{jobKey.Name} 失败: {ex.Message}"
+            );
         }
     }
 
@@ -545,11 +908,29 @@ public class QuartzJobService : IQuartzJobService
         {
             var jobKey = new JobKey(jobName, jobGroup);
 
-            // 删除调度器中的作业
-            var deleteResult = await _scheduler.DeleteJob(jobKey, cancellationToken);
-            if (!deleteResult)
+            // 删除调度器中的作业。
+            // 调度器已停止时 Quartz 会抛异常，必须跳过，否则后面的存储删除永远不会执行，
+            // 作业会变成「删不掉」的状态；单个作业删除失败也不应阻断存储清理
+            if (IsSchedulerAvailable)
             {
-                _logger.LogWarn("DeleteJob", $"从调度器删除作业失败: {jobGroup}.{jobName}");
+                // 先中断正在执行的实例：DeleteJob 只会移除作业定义，已在跑的实例不会停止，
+                // 否则删除后「执行中」计数会一直停在删除前的数量，线程池也被长期占满
+                await TryInterruptJobAsync(jobKey, cancellationToken);
+
+                try
+                {
+                    if (!await Scheduler.DeleteJob(jobKey, cancellationToken))
+                    {
+                        _logger.LogWarn("DeleteJob", $"从调度器删除作业失败: {jobGroup}.{jobName}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarn(
+                        "DeleteJob",
+                        $"从调度器删除作业异常: {jobGroup}.{jobName}, {ex.Message}"
+                    );
+                }
             }
 
             // 删除存储中的作业信息
@@ -564,6 +945,11 @@ public class QuartzJobService : IQuartzJobService
                 new QuartzJobLogQueryDto { JobName = jobName, JobGroup = jobGroup },
                 cancellationToken
             );
+
+            if (!storageResult)
+            {
+                return ApiResponseDto<bool>.ErrorResponse("作业不存在或删除失败");
+            }
 
             _logger.LogSuccess("DeleteJob", $"{jobGroup}.{jobName}");
             return ApiResponseDto<bool>.SuccessResponse(true, "作业删除成功");
@@ -595,42 +981,18 @@ public class QuartzJobService : IQuartzJobService
             {
                 try
                 {
-                    var jobKey = new JobKey(jobName, jobGroup);
-
-                    // 删除调度器中的作业
-                    var deleteResult = await _scheduler.DeleteJob(jobKey, cancellationToken);
-                    if (!deleteResult)
-                    {
-                        _logger.LogWarn(
-                            "BatchDeleteJobs",
-                            $"从调度器删除作业失败: {jobGroup}.{jobName}"
-                        );
-                    }
-
-                    // 删除存储中的作业信息
-                    var storageResult = await _jobStorage.DeleteJobAsync(
-                        jobName,
-                        jobGroup,
-                        cancellationToken
-                    );
-
-                    // 删除该作业的日志
-                    await _jobStorage.ClearJobLogsAsync(
-                        new QuartzJobLogQueryDto { JobName = jobName, JobGroup = jobGroup },
-                        cancellationToken
-                    );
-
-                    if (storageResult)
+                    // 复用单条删除逻辑：调度器已停止时会自动跳过调度器侧操作，只清理存储
+                    var result = await DeleteJobAsync(jobName, jobGroup, cancellationToken);
+                    if (result.Success)
                     {
                         successCount++;
-                        _logger.LogSuccess("BatchDeleteJobs", $"{jobGroup}.{jobName}");
                     }
                     else
                     {
                         failureCount++;
                         _logger.LogWarn(
                             "BatchDeleteJobs",
-                            $"从存储删除作业失败: {jobGroup}.{jobName}"
+                            $"删除作业失败: {jobGroup}.{jobName}, 原因: {result.Message}"
                         );
                     }
                 }
@@ -668,7 +1030,14 @@ public class QuartzJobService : IQuartzJobService
         try
         {
             var jobKey = new JobKey(jobName, jobGroup);
-            await _scheduler.PauseJob(jobKey, cancellationToken);
+            var schedulerAvailable = IsSchedulerAvailable;
+
+            // 调度器已停止时跳过 Quartz 侧暂停：Quartz 关闭后调用会抛异常，
+            // 导致连存储状态都更新不了
+            if (schedulerAvailable)
+            {
+                await Scheduler.PauseJob(jobKey, cancellationToken);
+            }
 
             // 更新作业状态
             var jobInfo = await _jobStorage.GetJobAsync(jobName, jobGroup, cancellationToken);
@@ -682,7 +1051,12 @@ public class QuartzJobService : IQuartzJobService
             }
 
             _logger.LogSuccess("PauseJob", $"{jobGroup}.{jobName}");
-            return ApiResponseDto<bool>.SuccessResponse(true, "作业暂停成功");
+            return schedulerAvailable
+                ? ApiResponseDto<bool>.SuccessResponse(true, "作业暂停成功")
+                : ApiResponseDto<bool>.SuccessResponse(
+                    true,
+                    "作业已暂停，调度器未运行，启动调度器后将保持暂停"
+                );
         }
         catch (Exception ex)
         {
@@ -715,16 +1089,33 @@ public class QuartzJobService : IQuartzJobService
                 return ApiResponseDto<bool>.ErrorResponse("作业不存在");
             }
 
+            // 调度器已停止：只恢复存储中的状态，启动调度器后会由重新加载流程接管
+            if (!IsSchedulerAvailable)
+            {
+                jobInfo.Status = JobStatus.Normal;
+                jobInfo.UpdateTime = DateTime.Now;
+                await _jobStorage.UpdateJobAsync(jobInfo, cancellationToken);
+
+                _logger.LogWarn(
+                    "ResumeJob",
+                    $"调度器未运行，作业状态已恢复: {jobGroup}.{jobName}"
+                );
+                return ApiResponseDto<bool>.SuccessResponse(
+                    true,
+                    "作业状态已恢复，调度器未运行，启动调度器后将自动加载"
+                );
+            }
+
             // 检查作业是否在调度器中存在
-            var jobExists = await _scheduler.CheckExists(jobKey, cancellationToken);
+            var jobExists = await Scheduler.CheckExists(jobKey, cancellationToken);
 
             if (jobExists)
             {
                 // 如果作业存在，先尝试恢复
-                await _scheduler.ResumeJob(jobKey, cancellationToken);
+                await Scheduler.ResumeJob(jobKey, cancellationToken);
 
-                // 检查是否有触发器
-                var triggers = await _scheduler.GetTriggersOfJob(jobKey, cancellationToken);
+                // 暂停的作业在调度器重建后可能没有任何触发器，需要重新调度
+                var triggers = await Scheduler.GetTriggersOfJob(jobKey, cancellationToken);
                 if (!triggers.Any())
                 {
                     _logger.LogInfo(
@@ -732,43 +1123,6 @@ public class QuartzJobService : IQuartzJobService
                         $"{jobGroup}.{jobName}"
                     );
                     await ScheduleJobAsync(jobInfo, cancellationToken);
-                }
-                else
-                {
-                    // 作业有触发器，重新获取所有触发器并更新下次执行时间
-                    triggers = await _scheduler.GetTriggersOfJob(jobKey, cancellationToken);
-                    if (triggers.Any())
-                    {
-                        var nextFireTimes = triggers
-                            .Select(t => t.GetNextFireTimeUtc())
-                            .Where(t => t.HasValue)
-                            .Select(t => t.Value)
-                            .OrderBy(t => t)
-                            .ToList();
-
-                        if (nextFireTimes.Any())
-                        {
-                            jobInfo.NextRunTime =
-                                jobInfo.NextRunTime == null
-                                    ? nextFireTimes.First().LocalDateTime
-                                    : jobInfo.NextRunTime;
-                        }
-
-                        var previousFireTimes = triggers
-                            .Select(t => t.GetPreviousFireTimeUtc())
-                            .Where(t => t.HasValue)
-                            .Select(t => t.Value)
-                            .OrderByDescending(t => t)
-                            .ToList();
-
-                        if (previousFireTimes.Any())
-                        {
-                            jobInfo.PreviousRunTime =
-                                jobInfo.PreviousRunTime == null
-                                    ? previousFireTimes.First().LocalDateTime
-                                    : jobInfo.PreviousRunTime;
-                        }
-                    }
                 }
             }
             else
@@ -785,40 +1139,8 @@ public class QuartzJobService : IQuartzJobService
             jobInfo.Status = JobStatus.Normal;
             jobInfo.UpdateTime = DateTime.Now;
 
-            // 获取触发器信息，更新下次执行时间
-            var updatedTriggers = await _scheduler.GetTriggersOfJob(jobKey, cancellationToken);
-            if (updatedTriggers.Any())
-            {
-                var nextFireTimes = updatedTriggers
-                    .Select(t => t.GetNextFireTimeUtc())
-                    .Where(t => t.HasValue)
-                    .Select(t => t.Value)
-                    .OrderBy(t => t)
-                    .ToList();
-
-                if (nextFireTimes.Any())
-                {
-                    jobInfo.NextRunTime =
-                        jobInfo.NextRunTime == null
-                            ? nextFireTimes.First().LocalDateTime
-                            : jobInfo.NextRunTime;
-                }
-
-                var previousFireTimes = updatedTriggers
-                    .Select(t => t.GetPreviousFireTimeUtc())
-                    .Where(t => t.HasValue)
-                    .Select(t => t.Value)
-                    .OrderByDescending(t => t)
-                    .ToList();
-
-                if (previousFireTimes.Any())
-                {
-                    jobInfo.PreviousRunTime =
-                        jobInfo.PreviousRunTime == null
-                            ? previousFireTimes.First().LocalDateTime
-                            : jobInfo.PreviousRunTime;
-                }
-            }
+            // 用调度器中触发器的实时时间刷新下次/上次执行时间
+            await FillExecutionTimesFromSchedulerAsync(jobInfo, jobKey, cancellationToken);
 
             await _jobStorage.UpdateJobAsync(jobInfo, cancellationToken);
 
@@ -829,6 +1151,55 @@ public class QuartzJobService : IQuartzJobService
         {
             _logger.LogFailure("ResumeJob", ex);
             return ApiResponseDto<bool>.ErrorResponse($"恢复作业失败: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 用调度器中触发器的时间刷新作业的下次/上次执行时间（仅在字段为空时填充）
+    /// </summary>
+    /// <param name="jobInfo">作业信息</param>
+    /// <param name="jobKey">作业键</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    private async Task FillExecutionTimesFromSchedulerAsync(
+        QuartzJobInfo jobInfo,
+        JobKey jobKey,
+        CancellationToken cancellationToken
+    )
+    {
+        var triggers = await Scheduler.GetTriggersOfJob(jobKey, cancellationToken);
+        if (!triggers.Any())
+        {
+            return;
+        }
+
+        if (jobInfo.NextRunTime == null)
+        {
+            var nextFireTime = triggers
+                .Select(t => t.GetNextFireTimeUtc())
+                .Where(t => t.HasValue)
+                .Select(t => t.GetValueOrDefault())
+                .OrderBy(t => t)
+                .FirstOrDefault();
+
+            if (nextFireTime != default)
+            {
+                jobInfo.NextRunTime = nextFireTime.LocalDateTime;
+            }
+        }
+
+        if (jobInfo.PreviousRunTime == null)
+        {
+            var previousFireTime = triggers
+                .Select(t => t.GetPreviousFireTimeUtc())
+                .Where(t => t.HasValue)
+                .Select(t => t.GetValueOrDefault())
+                .OrderByDescending(t => t)
+                .FirstOrDefault();
+
+            if (previousFireTime != default)
+            {
+                jobInfo.PreviousRunTime = previousFireTime.LocalDateTime;
+            }
         }
     }
 
@@ -946,15 +1317,25 @@ public class QuartzJobService : IQuartzJobService
                 }
 
                 var jobKey = new JobKey(jobName, jobGroup);
+                var schedulerAvailable = IsSchedulerAvailable;
 
-                if (enable)
+                if (!schedulerAvailable)
+                {
+                    // 调度器未运行：只更新存储中的启用状态，启动后由重新加载流程接管
+                    jobInfo.IsEnabled = enable;
+                    if (!enable)
+                    {
+                        jobInfo.NextRunTime = null;
+                    }
+                }
+                else if (enable)
                 {
                     jobInfo.IsEnabled = true;
                     if (jobInfo.Status == JobStatus.Paused)
                     {
                         // 启用时保持原有的暂停状态：先调度再暂停
                         await ScheduleJobAsync(jobInfo, cancellationToken);
-                        await _scheduler.PauseJob(jobKey, cancellationToken);
+                        await Scheduler.PauseJob(jobKey, cancellationToken);
                         jobInfo.Status = JobStatus.Paused;
                         jobInfo.NextRunTime = null;
                     }
@@ -967,9 +1348,11 @@ public class QuartzJobService : IQuartzJobService
                 {
                     jobInfo.IsEnabled = false;
                     jobInfo.NextRunTime = null;
-                    if (await _scheduler.CheckExists(jobKey, cancellationToken))
+                    if (await Scheduler.CheckExists(jobKey, cancellationToken))
                     {
-                        await _scheduler.DeleteJob(jobKey, cancellationToken);
+                        // 禁用即停止：先中断执行中的实例，避免线程被占用到本次执行结束
+                        await TryInterruptJobAsync(jobKey, cancellationToken);
+                        await Scheduler.DeleteJob(jobKey, cancellationToken);
                     }
                 }
 
@@ -998,9 +1381,32 @@ public class QuartzJobService : IQuartzJobService
     /// <param name="jobGroup">作业分组</param>
     /// <param name="cancellationToken">取消令牌</param>
     /// <returns>操作结果</returns>
-    public async Task<ApiResponseDto<bool>> TriggerJobAsync(
+    public Task<ApiResponseDto<bool>> TriggerJobAsync(
         string jobName,
         string jobGroup,
+        CancellationToken cancellationToken = default
+    )
+    {
+        return TriggerJobWithContextAsync(
+            jobName,
+            jobGroup,
+            TriggerType.Manual,
+            cancellationToken: cancellationToken
+        );
+    }
+
+    /// <summary>
+    /// 带执行上下文触发作业（手动/补偿共用）。
+    /// 执行级标记只写入触发器，不写入 JobDetail，避免被后续 Cron 触发复用。
+    /// </summary>
+    public async Task<ApiResponseDto<bool>> TriggerJobWithContextAsync(
+        string jobName,
+        string jobGroup,
+        TriggerType triggerType,
+        Guid? logId = null,
+        Guid? recoverySourceLogId = null,
+        int recoveryAttempt = 1,
+        string? triggeredBy = null,
         CancellationToken cancellationToken = default
     )
     {
@@ -1015,11 +1421,48 @@ public class QuartzJobService : IQuartzJobService
                 return ApiResponseDto<bool>.ErrorResponse("作业不存在");
             }
 
-            // 创建包含完整作业数据和手动触发标记的作业数据映射
-            var jobDataMap = CreateJobDataMapWithManualTrigger(jobInfo);
+            // 调度器已停止时 TriggerJob 会抛 SchedulerException，这里提前给出明确提示
+            if (!IsSchedulerAvailable)
+            {
+                return ApiResponseDto<bool>.ErrorResponse(
+                    "调度器已停止，无法触发作业，请先启动调度器",
+                    "SCHEDULER_NOT_RUNNING"
+                );
+            }
+
+            // 持久化数据：仅作业自身配置，允许写入 JobDetail
+            var persistentMap = CreatePersistentJobDataMap(jobInfo);
+            // 执行级数据：每次触发独立，绝不能写入 JobDetail
+            var executionMap = new JobDataMap();
+            foreach (var pair in persistentMap)
+            {
+                executionMap[pair.Key] = pair.Value;
+            }
+            executionMap[QuartzJobConst.TriggerType] = triggerType.ToString();
+            if (triggerType == TriggerType.Manual)
+            {
+                executionMap[QuartzJobConst.IsManualTrigger] = true;
+            }
+            if (logId.HasValue)
+            {
+                executionMap[QuartzJobConst.LogId] = logId.Value.ToString();
+            }
+            if (recoverySourceLogId.HasValue)
+            {
+                executionMap[QuartzJobConst.RecoverySourceLogId] =
+                    recoverySourceLogId.Value.ToString();
+            }
+            if (recoveryAttempt > 1)
+            {
+                executionMap[QuartzJobConst.RecoveryAttempt] = recoveryAttempt;
+            }
+            if (!string.IsNullOrWhiteSpace(triggeredBy))
+            {
+                executionMap[QuartzJobConst.TriggeredBy] = triggeredBy;
+            }
 
             // 检查作业是否在调度器中存在
-            var jobExists = await _scheduler.CheckExists(jobKey, cancellationToken);
+            var jobExists = await Scheduler.CheckExists(jobKey, cancellationToken);
 
             // 如果作业不存在，先添加到调度器
             if (!jobExists)
@@ -1029,15 +1472,13 @@ public class QuartzJobService : IQuartzJobService
                     $"{jobGroup}.{jobName}"
                 );
 
-                // 创建作业构建器
                 var jobBuilder = JobBuilder
                     .Create()
                     .WithIdentity(jobKey)
                     .WithDescription(jobInfo.Description ?? string.Empty)
                     .StoreDurably(true); // 没有触发器的作业必须设置为持久化
 
-                // 禁止并发执行：与 ScheduleJobAsync 保持一致，
-                // 手动触发兜底注册的作业同样需要携带该标志，否则并发开关在手动触发场景失效
+                // 禁止并发执行：与 ScheduleJobAsync 保持一致
                 if (jobInfo.DisallowConcurrentExecution)
                 {
                     jobBuilder.DisallowConcurrentExecution();
@@ -1047,7 +1488,6 @@ public class QuartzJobService : IQuartzJobService
                 Type? realJobType = jobInfo.JobType == JobTypeEnum.API ? typeof(ApiJob) : null;
                 if (realJobType == null)
                 {
-                    // DLL作业使用指定的作业类
                     realJobType = GetJobType(jobInfo.JobClassOrApi);
                     if (realJobType == null || !typeof(IJob).IsAssignableFrom(realJobType))
                     {
@@ -1060,37 +1500,34 @@ public class QuartzJobService : IQuartzJobService
                 if (jobInfo.RetryCount > 0)
                 {
                     jobBuilder.OfType<RetryJobWrapper>();
-                    jobDataMap.Put(QuartzJobConst.RealJobType, realJobType.AssemblyQualifiedName!);
-                    jobDataMap.Put(QuartzJobConst.RetryCount, jobInfo.RetryCount);
-                    jobDataMap.Put(
-                        QuartzJobConst.RetryIntervalSeconds,
-                        jobInfo.RetryIntervalSeconds > 0 ? jobInfo.RetryIntervalSeconds : 30
-                    );
+                    persistentMap.Put(QuartzJobConst.RealJobType, realJobType.AssemblyQualifiedName!);
+                    persistentMap.Put(QuartzJobConst.RetryCount, jobInfo.RetryCount);
+                    var interval = jobInfo.RetryIntervalSeconds > 0
+                        ? jobInfo.RetryIntervalSeconds
+                        : 30;
+                    persistentMap.Put(QuartzJobConst.RetryIntervalSeconds, interval);
+
+                    executionMap.Put(QuartzJobConst.RealJobType, realJobType.AssemblyQualifiedName!);
+                    executionMap.Put(QuartzJobConst.RetryCount, jobInfo.RetryCount);
+                    executionMap.Put(QuartzJobConst.RetryIntervalSeconds, interval);
                 }
                 else
                 {
                     jobBuilder.OfType(realJobType);
                 }
 
-                // 将作业数据添加到作业构建器
-                jobBuilder.UsingJobData(jobDataMap);
-
-                // 创建作业详情
+                // 只把持久化数据写入作业详情
+                jobBuilder.UsingJobData(persistentMap);
                 var jobDetail = jobBuilder.Build();
-
-                // 添加作业到调度器
-                await _scheduler.AddJob(jobDetail, true, cancellationToken);
-
-                // 触发作业
-                await _scheduler.TriggerJob(jobDetail.Key, jobDataMap, cancellationToken);
-            }
-            else
-            {
-                // 直接触发作业，Quartz允许手动触发暂停的作业，无需修改作业状态
-                await _scheduler.TriggerJob(jobKey, jobDataMap, cancellationToken);
+                await Scheduler.AddJob(jobDetail, true, cancellationToken);
             }
 
-            _logger.LogSuccess("TriggerJob", $"手动触发作业成功: {jobGroup}.{jobName}");
+            await Scheduler.TriggerJob(jobKey, executionMap, cancellationToken);
+
+            _logger.LogSuccess(
+                "TriggerJob",
+                $"触发作业成功: {jobGroup}.{jobName}, 来源: {triggerType}"
+            );
             return ApiResponseDto<bool>.SuccessResponse(true, "作业触发成功");
         }
         catch (Exception ex)
@@ -1101,17 +1538,12 @@ public class QuartzJobService : IQuartzJobService
     }
 
     /// <summary>
-    /// 创建包含手动触发标记的作业数据映射
+    /// 创建持久化作业数据映射（只包含作业自身配置）
     /// </summary>
-    /// <param name="jobInfo">作业信息</param>
-    /// <returns>作业数据映射</returns>
-    private JobDataMap CreateJobDataMapWithManualTrigger(QuartzJobInfo jobInfo)
+    private JobDataMap CreatePersistentJobDataMap(QuartzJobInfo jobInfo)
     {
         var jobDataMap = new JobDataMap();
 
-        // 添加手动触发标记
-        jobDataMap.Add("IsManualTrigger", true);
-        // 解析并添加作业数据
         if (!string.IsNullOrEmpty(jobInfo.JobData))
         {
             jobDataMap.Add(QuartzJobConst.JobData, jobInfo.JobData);
@@ -1167,11 +1599,18 @@ public class QuartzJobService : IQuartzJobService
             {
                 var jobResponse = MapToResponseDto(jobInfo);
 
+                // 调度器已停止时无法查询实时触发器，直接返回存储中的时间，避免逐个作业记警告
+                if (!IsSchedulerAvailable)
+                {
+                    responseItems.Add(jobResponse);
+                    continue;
+                }
+
                 // 从调度器获取实时的触发信息
                 try
                 {
                     var jobKey = new JobKey(jobInfo.JobName, jobInfo.JobGroup);
-                    var triggers = await _scheduler.GetTriggersOfJob(jobKey, cancellationToken);
+                    var triggers = await Scheduler.GetTriggersOfJob(jobKey, cancellationToken);
                     _logger.LogInfo(
                         "获取作业列表",
                         "作业: {JobKey} 找到 {TriggerCount} 个触发器",
@@ -1290,22 +1729,35 @@ public class QuartzJobService : IQuartzJobService
 
             var response = MapToResponseDto(jobInfo);
 
-            // 获取调度器中的作业信息
-            var jobKey = new JobKey(jobName, jobGroup);
-            var jobDetail = await _scheduler.GetJobDetail(jobKey, cancellationToken);
-            var triggers = await _scheduler.GetTriggersOfJob(jobKey, cancellationToken);
-
-            if (triggers.Any())
+            // 调度器中的实时触发器信息仅用于补全时间字段：
+            // 调度器已停止或查询失败时降级为只使用存储中的时间，保证详情仍可打开
+            if (IsSchedulerAvailable)
             {
-                var trigger = triggers.First();
-                response.NextRunTime =
-                    response.NextRunTime == null
-                        ? trigger.GetNextFireTimeUtc()?.LocalDateTime
-                        : response.NextRunTime;
-                response.PreviousRunTime =
-                    response.PreviousRunTime == null
-                        ? trigger.GetPreviousFireTimeUtc()?.LocalDateTime
-                        : response.PreviousRunTime;
+                try
+                {
+                    var jobKey = new JobKey(jobName, jobGroup);
+                    var triggers = await Scheduler.GetTriggersOfJob(jobKey, cancellationToken);
+
+                    if (triggers.Any())
+                    {
+                        var trigger = triggers.First();
+                        response.NextRunTime =
+                            response.NextRunTime == null
+                                ? trigger.GetNextFireTimeUtc()?.LocalDateTime
+                                : response.NextRunTime;
+                        response.PreviousRunTime =
+                            response.PreviousRunTime == null
+                                ? trigger.GetPreviousFireTimeUtc()?.LocalDateTime
+                                : response.PreviousRunTime;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarn(
+                        "GetJobDetail",
+                        $"获取作业 {jobGroup}.{jobName} 的调度器信息失败: {ex.Message}"
+                    );
+                }
             }
 
             return ApiResponseDto<QuartzJobResponseDto>.SuccessResponse(response);
@@ -1330,14 +1782,22 @@ public class QuartzJobService : IQuartzJobService
     {
         try
         {
-            var jobKeys = await _scheduler.GetJobKeys(
+            // 调度器已停止时其中的作业已随实例销毁，无需也无法再清理
+            if (!IsSchedulerAvailable)
+            {
+                return ApiResponseDto<bool>.SuccessResponse(true, "调度器未运行，无需清理");
+            }
+
+            var jobKeys = await Scheduler.GetJobKeys(
                 GroupMatcher<JobKey>.AnyGroup(),
                 cancellationToken
             );
 
             foreach (var jobKey in jobKeys)
             {
-                await _scheduler.DeleteJob(jobKey, cancellationToken);
+                // 与单条删除保持一致：先中断执行中的实例，再移除作业定义
+                await TryInterruptJobAsync(jobKey, cancellationToken);
+                await Scheduler.DeleteJob(jobKey, cancellationToken);
             }
 
             _logger.LogSuccess("ClearAllJobs");
@@ -1374,9 +1834,28 @@ public class QuartzJobService : IQuartzJobService
                 return ApiResponseDto<bool>.ErrorResponse("作业不存在");
             }
 
+            var nextRunTime = trigger.GetNextFireTimeUtc()?.LocalDateTime;
+            var previousRunTime = trigger.GetPreviousFireTimeUtc()?.LocalDateTime;
+
+            // 手动/补偿触发使用的是 Quartz 临时触发器，其 NextFireTimeUtc 恒为 null，
+            // 直接写入会把 Cron 触发器的下次执行时间清空，
+            // 因此回落到作业自身的持久化触发器；无法判断时保留原值
+            if (nextRunTime == null)
+            {
+                var (resolved, nextFromTriggers) = await TryGetNextFireTimeFromTriggersAsync(
+                    jobName,
+                    jobGroup,
+                    cancellationToken
+                );
+                nextRunTime = resolved ? nextFromTriggers : jobInfo.NextRunTime;
+            }
+
             // 更新作业执行时间
-            jobInfo.NextRunTime = trigger.GetNextFireTimeUtc()?.LocalDateTime;
-            jobInfo.PreviousRunTime = trigger.GetPreviousFireTimeUtc()?.LocalDateTime;
+            jobInfo.NextRunTime = nextRunTime;
+            if (previousRunTime.HasValue)
+            {
+                jobInfo.PreviousRunTime = previousRunTime;
+            }
             jobInfo.UpdateTime = DateTime.Now;
 
             // 保存到存储
@@ -1393,6 +1872,50 @@ public class QuartzJobService : IQuartzJobService
         {
             _logger.LogFailure("更新作业执行时间信息", ex);
             return ApiResponseDto<bool>.ErrorResponse($"更新作业执行时间失败: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 从作业的持久化触发器中取最近的下次执行时间
+    /// </summary>
+    /// <param name="jobName">作业名称</param>
+    /// <param name="jobGroup">作业分组</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>Resolved=false 表示调度器不可用、无法判断，调用方应保留原值</returns>
+    private async Task<(bool Resolved, DateTime? NextFireTime)> TryGetNextFireTimeFromTriggersAsync(
+        string jobName,
+        string jobGroup,
+        CancellationToken cancellationToken
+    )
+    {
+        if (!IsSchedulerAvailable)
+        {
+            return (false, null);
+        }
+
+        try
+        {
+            var triggers = await Scheduler.GetTriggersOfJob(
+                new JobKey(jobName, jobGroup),
+                cancellationToken
+            );
+
+            var nextFireTime = triggers
+                .Select(t => t.GetNextFireTimeUtc())
+                .Where(t => t.HasValue)
+                .Select(t => t.GetValueOrDefault())
+                .OrderBy(t => t)
+                .FirstOrDefault();
+
+            return (true, nextFireTime == default ? null : nextFireTime.LocalDateTime);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarn(
+                "获取下次执行时间",
+                $"获取作业 {jobGroup}.{jobName} 的下次执行时间失败: {ex.Message}"
+            );
+            return (false, null);
         }
     }
 
@@ -1569,7 +2092,7 @@ public class QuartzJobService : IQuartzJobService
         var trigger = triggerBuilder.Build();
 
         // 调度作业 - 允许替换现有的作业和触发器
-        await _scheduler.ScheduleJob(
+        await Scheduler.ScheduleJob(
             jobDetail,
             new List<ITrigger> { trigger },
             true,
@@ -1712,6 +2235,9 @@ public class QuartzJobService : IQuartzJobService
             RetryIntervalSeconds = jobInfo.RetryIntervalSeconds,
             SkipSslValidation = jobInfo.SkipSslValidation,
             DisallowConcurrentExecution = jobInfo.DisallowConcurrentExecution,
+            RerunOnRecovery = jobInfo.RerunOnRecovery,
+            EffectiveRerunOnRecovery =
+                jobInfo.RerunOnRecovery ?? _recoveryOptions.Current.DefaultRerunOnRecovery,
             Dependencies = JobDependencyHelper.Deserialize(jobInfo.Dependencies),
             StartTime = jobInfo.StartTime,
             EndTime = jobInfo.EndTime,
@@ -1751,6 +2277,30 @@ public class QuartzJobService : IQuartzJobService
             _logger.LogError(ex, "获取作业日志失败");
             return ApiResponseDto<PagedResponseDto<QuartzJobLog>>.ErrorResponse(
                 $"获取作业日志失败: {ex.Message}"
+            );
+        }
+    }
+
+    /// <summary>
+    /// 获取单条日志
+    /// </summary>
+    public async Task<ApiResponseDto<QuartzJobLog>> GetJobLogAsync(
+        Guid logId,
+        CancellationToken cancellationToken = default
+    )
+    {
+        try
+        {
+            var log = await _jobStorage.GetJobLogAsync(logId, cancellationToken);
+            return log == null
+                ? ApiResponseDto<QuartzJobLog>.ErrorResponse("日志不存在", "LOG_NOT_FOUND")
+                : ApiResponseDto<QuartzJobLog>.SuccessResponse(log);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "获取日志详情失败");
+            return ApiResponseDto<QuartzJobLog>.ErrorResponse(
+                $"获取日志详情失败: {ex.Message}"
             );
         }
     }
@@ -1799,9 +2349,16 @@ public class QuartzJobService : IQuartzJobService
     {
         try
         {
-            var expression = new CronExpression(cronExpression);
-            var isValid = expression.IsSatisfiedBy(DateTimeOffset.Now);
-            return ApiResponseDto<bool>.SuccessResponse(isValid, "Cron表达式有效");
+            if (string.IsNullOrWhiteSpace(cronExpression))
+            {
+                return ApiResponseDto<bool>.ErrorResponse("Cron表达式无效: 表达式不能为空");
+            }
+
+            // 构造成功即表示语法合法。
+            // IsSatisfiedBy(Now) 只表示「此刻是否匹配」，不能作为有效性判断，
+            // 否则像 0 0 3 * * ? 这类合法表达式会返回 false
+            _ = new CronExpression(cronExpression);
+            return ApiResponseDto<bool>.SuccessResponse(true, "Cron表达式有效");
         }
         catch (Exception ex)
         {
@@ -2184,7 +2741,7 @@ public class QuartzJobService : IQuartzJobService
     /// </summary>
     /// <param name="cancellationToken">取消令牌</param>
     /// <returns>系统配置</returns>
-    public async Task<ApiResponseDto<SystemConfigDto>> GetSystemConfigAsync(
+    public async Task<ApiResponseDto<SystemConfigResponseDto>> GetSystemConfigAsync(
         CancellationToken cancellationToken = default
     )
     {
@@ -2209,12 +2766,30 @@ public class QuartzJobService : IQuartzJobService
                 config = new SystemConfigDto();
             }
 
-            return ApiResponseDto<SystemConfigDto>.SuccessResponse(config, "获取系统配置成功");
+            // 兜底：未经过启动 HostedService 时（如单元测试）也能拿到生效快照
+            if (!_recoveryOptions.IsInitialized)
+            {
+                _recoveryOptions.Initialize(config);
+            }
+
+            var response =
+                JsonSerializer.Deserialize<SystemConfigResponseDto>(
+                    JsonSerializer.Serialize(config, SystemConfigJsonOptions),
+                    SystemConfigJsonOptions
+                ) ?? new SystemConfigResponseDto();
+            response.EffectiveConfig = _recoveryOptions.Current;
+            response.RestartRequired = _recoveryOptions.ComputeRestartRequired(config);
+            response.BootTime = _runtimeInstance.BootTime;
+
+            return ApiResponseDto<SystemConfigResponseDto>.SuccessResponse(
+                response,
+                "获取系统配置成功"
+            );
         }
         catch (Exception ex)
         {
             _logger.LogFailure("GetSystemConfig", ex);
-            return ApiResponseDto<SystemConfigDto>.ErrorResponse(
+            return ApiResponseDto<SystemConfigResponseDto>.ErrorResponse(
                 $"获取系统配置失败: {ex.Message}"
             );
         }
@@ -2233,12 +2808,24 @@ public class QuartzJobService : IQuartzJobService
     {
         try
         {
+            // 「等待完成」已并入「排水后停止」，历史配置保存时统一归一化为 Drain
+            if (config.ShutdownMode == ShutdownMode.Wait)
+            {
+                config.ShutdownMode = ShutdownMode.Drain;
+            }
+
+            var validationError = RecoveryOptionsProvider.Validate(config);
+            if (validationError != null)
+            {
+                return ApiResponseDto<bool>.ErrorResponse(validationError, "CONFIG_INVALID");
+            }
+
             var json = JsonSerializer.Serialize(config, SystemConfigJsonOptions);
             var setting = new QuartzSetting
             {
                 Key = SystemConfigSettingKey,
                 Value = json,
-                Description = "系统基础配置（服务名称、环境、描述）",
+                Description = "系统基础配置（服务名称、环境、描述、停机与恢复策略）",
                 Enabled = true,
                 UpdateTime = DateTime.Now,
             };
@@ -2247,7 +2834,13 @@ public class QuartzJobService : IQuartzJobService
             if (result)
             {
                 _logger.LogSuccess("SaveSystemConfig", "保存系统配置成功");
-                return ApiResponseDto<bool>.SuccessResponse(true, "保存系统配置成功");
+                var restartRequired =
+                    _recoveryOptions.IsInitialized
+                    && _recoveryOptions.ComputeRestartRequired(config);
+                return ApiResponseDto<bool>.SuccessResponse(
+                    true,
+                    restartRequired ? "保存成功，重启应用后生效" : "保存系统配置成功"
+                );
             }
             else
             {
