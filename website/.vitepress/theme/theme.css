@@ -726,13 +726,18 @@ body:has(.ca-landing) .VPLocalNav {
 
 .ca-window-title {
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
   color: rgba(255, 255, 255, 0.55);
   font-size: 12.5px;
   text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ca-window-mode {
   display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 6px;
   color: var(--nm-cyan-soft);
@@ -1463,7 +1468,7 @@ body:has(.ca-landing) .VPLocalNav {
   }
 
   .ca-hero-title {
-    font-size: clamp(40px, 12.5vw, 54px);
+    font-size: clamp(28px, 8.6vw, 54px);
     letter-spacing: -0.04em;
   }
 
