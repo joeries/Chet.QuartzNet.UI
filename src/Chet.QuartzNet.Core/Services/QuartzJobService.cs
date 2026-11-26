@@ -368,6 +368,7 @@ public class QuartzJobService : IQuartzJobService
                     if (triggers.Any())
                     {
                         _logger.LogInfo(
+                            "ReloadNormalJobs",
                             "作业 {JobKey} 已存在 {TriggerCount} 个触发器，跳过重新加载",
                             $"{jobInfo.JobGroup}.{jobInfo.JobName}",
                             triggers.Count
@@ -379,6 +380,7 @@ public class QuartzJobService : IQuartzJobService
                     if (!jobInfo.IsEnabled)
                     {
                         _logger.LogInfo(
+                            "ReloadNormalJobs",
                             "作业 {JobKey} 处于禁用状态，跳过重新加载",
                             $"{jobInfo.JobGroup}.{jobInfo.JobName}"
                         );
@@ -389,6 +391,7 @@ public class QuartzJobService : IQuartzJobService
                     if (jobInfo.Status == Chet.QuartzNet.Models.Entities.JobStatus.Paused)
                     {
                         _logger.LogInfo(
+                            "ReloadNormalJobs",
                             "作业 {JobKey} 处于暂停状态，跳过重新加载",
                             $"{jobInfo.JobGroup}.{jobInfo.JobName}"
                         );
@@ -533,6 +536,134 @@ public class QuartzJobService : IQuartzJobService
     )
     {
         return _recoveryCoordinator.RerunAsync(logId, triggeredBy, cancellationToken);
+    }
+
+    /// <summary>
+    /// 手动中断在 SkipReason 中的固定前缀。
+    /// 手动中断与不可预期中断共用「中断」状态，靠此前缀在展示层区分，不做为查询/统计依据。
+    /// </summary>
+    public const string ManualInterruptPrefix = "【手动中断】";
+
+    /// <summary>
+    /// 手动中断一条运行中日志对应的执行实例。
+    /// 仅对当前节点内、且会观察 <see cref="IJobExecutionContext.CancellationToken"/> 的作业生效：
+    /// Quartz 的 Interrupt 是协作式取消，不会强行终止线程。
+    /// </summary>
+    /// <param name="logId">运行中日志ID</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>操作结果</returns>
+    public async Task<ApiResponseDto<bool>> InterruptRunningJobAsync(
+        Guid logId,
+        CancellationToken cancellationToken = default
+    )
+    {
+        try
+        {
+            var log = await _jobStorage.GetJobLogAsync(logId, cancellationToken);
+            if (log == null)
+            {
+                return ApiResponseDto<bool>.ErrorResponse("日志不存在", "LOG_NOT_FOUND");
+            }
+
+            if (log.Status != LogStatus.Running)
+            {
+                return ApiResponseDto<bool>.ErrorResponse(
+                    "只有运行中的作业可以中断",
+                    "LOG_NOT_RUNNING"
+                );
+            }
+
+            // 停机/重启后残留的 Running 记录，本进程里并不存在这个执行，不能误标中断
+            if (
+                log.InstanceId != _runtimeInstance.InstanceId
+                || (log.BootId.HasValue && log.BootId != _runtimeInstance.BootId)
+            )
+            {
+                return ApiResponseDto<bool>.ErrorResponse(
+                    "该执行不在当前节点，或已随进程重启结束，无法中断",
+                    "LOG_NOT_ON_THIS_NODE"
+                );
+            }
+
+            if (!IsSchedulerAvailable)
+            {
+                return ApiResponseDto<bool>.ErrorResponse(
+                    "调度器已停止，无法中断作业",
+                    "SCHEDULER_NOT_RUNNING"
+                );
+            }
+
+            var jobKey = new JobKey(log.JobName, log.JobGroup);
+
+            // 同一 JobKey 允许并发时，按 FireTime 找最接近本次日志的一条，
+            // 精确到 fireInstanceId，避免把该作业的其它并发实例一起中断
+            var target = (await Scheduler.GetCurrentlyExecutingJobs(cancellationToken))
+                .Where(c => c.JobDetail.Key.Equals(jobKey))
+                .OrderBy(c =>
+                    Math.Abs((c.FireTimeUtc.LocalDateTime - log.StartTime).TotalMilliseconds)
+                )
+                .FirstOrDefault();
+
+            if (target == null)
+            {
+                return ApiResponseDto<bool>.ErrorResponse(
+                    "未找到正在执行的实例，可能已结束",
+                    "EXECUTION_NOT_FOUND"
+                );
+            }
+
+            const string reason = ManualInterruptPrefix + "用户手动中断作业";
+
+            // 必须先标记再中断：中断会让作业立刻抛取消异常，
+            // 若监听器抢先写入就会把状态改成「失败」；而监听器对
+            // 「已标记中断 + 令牌已取消」的记录会保留中断状态
+            if (
+                !await _jobStorage.TryMarkInterruptedAsync(
+                    logId,
+                    _runtimeInstance.InstanceId,
+                    DateTime.Now,
+                    reason,
+                    cancellationToken
+                )
+            )
+            {
+                return ApiResponseDto<bool>.ErrorResponse(
+                    "作业已结束，无法中断",
+                    "EXECUTION_FINISHED"
+                );
+            }
+
+            // TryMarkInterrupted 会把补偿状态置为待补偿，手动中断不应进入自动补偿
+            await _jobStorage.MarkCompensationResultAsync(
+                logId,
+                CompensationStatus.Skipped,
+                null,
+                reason,
+                cancellationToken
+            );
+
+            // 再中断：优先精确到本次执行，失败时回退到 JobKey 维度
+            var interrupted =
+                await Scheduler.Interrupt(target.FireInstanceId, cancellationToken)
+                || await Scheduler.Interrupt(jobKey, cancellationToken);
+
+            if (!interrupted)
+            {
+                // 极端情况：标记后发现执行已结束，状态由监听器按真实结果覆盖
+                return ApiResponseDto<bool>.ErrorResponse(
+                    "作业已结束，无法中断",
+                    "EXECUTION_FINISHED"
+                );
+            }
+
+            _logger.LogSuccess("中断作业", $"{log.JobGroup}.{log.JobName}, 日志: {logId}");
+            return ApiResponseDto<bool>.SuccessResponse(true, "已请求中断作业");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogFailure("中断作业", ex);
+            return ApiResponseDto<bool>.ErrorResponse($"中断作业失败: {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -1119,6 +1250,7 @@ public class QuartzJobService : IQuartzJobService
                 if (!triggers.Any())
                 {
                     _logger.LogInfo(
+                        "ResumeJob",
                         "作业 {JobKey} 恢复后没有触发器，重新调度作业",
                         $"{jobGroup}.{jobName}"
                     );
@@ -1129,6 +1261,7 @@ public class QuartzJobService : IQuartzJobService
             {
                 // 如果作业不存在，重新调度作业
                 _logger.LogInfo(
+                    "ResumeJob",
                     "作业 {JobKey} 在调度器中不存在，重新调度作业",
                     $"{jobGroup}.{jobName}"
                 );
@@ -1468,6 +1601,7 @@ public class QuartzJobService : IQuartzJobService
             if (!jobExists)
             {
                 _logger.LogInfo(
+                    "TriggerJobWithContext",
                     "作业不在调度器中，先添加作业到调度器: {JobKey}",
                     $"{jobGroup}.{jobName}"
                 );
@@ -1500,16 +1634,17 @@ public class QuartzJobService : IQuartzJobService
                 if (jobInfo.RetryCount > 0)
                 {
                     jobBuilder.OfType<RetryJobWrapper>();
-                    persistentMap.Put(QuartzJobConst.RealJobType, realJobType.AssemblyQualifiedName!);
-                    persistentMap.Put(QuartzJobConst.RetryCount, jobInfo.RetryCount);
+                    // Quartz 3.22 起 Put(...) 已过时，统一改用索引器
+                    persistentMap[QuartzJobConst.RealJobType] = realJobType.AssemblyQualifiedName!;
+                    persistentMap[QuartzJobConst.RetryCount] = jobInfo.RetryCount;
                     var interval = jobInfo.RetryIntervalSeconds > 0
                         ? jobInfo.RetryIntervalSeconds
                         : 30;
-                    persistentMap.Put(QuartzJobConst.RetryIntervalSeconds, interval);
+                    persistentMap[QuartzJobConst.RetryIntervalSeconds] = interval;
 
-                    executionMap.Put(QuartzJobConst.RealJobType, realJobType.AssemblyQualifiedName!);
-                    executionMap.Put(QuartzJobConst.RetryCount, jobInfo.RetryCount);
-                    executionMap.Put(QuartzJobConst.RetryIntervalSeconds, interval);
+                    executionMap[QuartzJobConst.RealJobType] = realJobType.AssemblyQualifiedName!;
+                    executionMap[QuartzJobConst.RetryCount] = jobInfo.RetryCount;
+                    executionMap[QuartzJobConst.RetryIntervalSeconds] = interval;
                 }
                 else
                 {
@@ -2733,7 +2868,25 @@ public class QuartzJobService : IQuartzJobService
         PropertyNameCaseInsensitive = true,
         // 中文等非 ASCII 字符按原文输出，避免保存成 \uXXXX 转义
         Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        // 枚举统一按字符串读写，避免不同宿主配置下出现数字/字符串两种形态
+        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() },
     };
+
+    /// <summary>
+    /// 归一化系统配置：历史「等待完成」已并入「排水后停止」，
+    /// 读取与保存都用 Drain 表示，避免存储中的旧值长期被当成「待重启生效的变更」
+    /// </summary>
+    /// <param name="config">系统配置</param>
+    /// <returns>归一化后的配置</returns>
+    private static SystemConfigDto NormalizeConfig(SystemConfigDto config)
+    {
+        if (config.ShutdownMode == ShutdownMode.Wait)
+        {
+            config.ShutdownMode = ShutdownMode.Drain;
+        }
+
+        return config;
+    }
 
     /// <summary>
     /// 获取系统配置
@@ -2765,6 +2918,10 @@ public class QuartzJobService : IQuartzJobService
             {
                 config = new SystemConfigDto();
             }
+
+            // 读取路径同样归一化历史「等待完成」：持久化里残留的旧值不再和
+            // 生效快照（已按 Drain 运行）反复产生「重启后生效」的差异
+            config = NormalizeConfig(config);
 
             // 兜底：未经过启动 HostedService 时（如单元测试）也能拿到生效快照
             if (!_recoveryOptions.IsInitialized)
@@ -2809,10 +2966,7 @@ public class QuartzJobService : IQuartzJobService
         try
         {
             // 「等待完成」已并入「排水后停止」，历史配置保存时统一归一化为 Drain
-            if (config.ShutdownMode == ShutdownMode.Wait)
-            {
-                config.ShutdownMode = ShutdownMode.Drain;
-            }
+            config = NormalizeConfig(config);
 
             var validationError = RecoveryOptionsProvider.Validate(config);
             if (validationError != null)
